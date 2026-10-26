@@ -279,6 +279,8 @@ struct NetEdit {
     to: String,
     from: String,
     pad: String,
+    footprint: String,
+    number: String,
 }
 
 /// `unconnected-(REF-REST)` split into its reference and the rest.
@@ -335,6 +337,8 @@ fn plan_generated_net_names(
                 to: expected.clone(),
                 from: pad.name.clone(),
                 pad: format!("{}/{}", component.reference, pad.number),
+                footprint: span.id.clone(),
+                number: pad.number.clone(),
             });
         }
     }
@@ -513,19 +517,16 @@ pub(super) fn handle_with(
 }
 
 fn verify_net_names(spans: &[FootprintSpan], edits: &[NetEdit]) -> Result<()> {
-    for NetEdit { to, from, pad, .. } in edits {
-        let renamed = spans
+    for edit in edits {
+        let name = spans
             .iter()
-            .flat_map(|span| &span.pads)
-            .filter(|p| p.name == *to)
-            .count();
-        let stale = spans
-            .iter()
-            .flat_map(|span| &span.pads)
-            .any(|p| p.name == *from);
+            .find(|span| span.id == edit.footprint)
+            .and_then(|span| span.pads.iter().find(|pad| pad.number == edit.number))
+            .map(|pad| pad.name.as_str());
         anyhow::ensure!(
-            renamed == 1 && !stale,
-            "Generated net name for {pad} did not read back as planned"
+            name == Some(edit.to.as_str()),
+            "Generated net name for {} did not read back as planned",
+            edit.pad
         );
     }
     Ok(())
@@ -796,5 +797,28 @@ mod tests {
             body(handle_with(&path, "n", &net_design(true), 1, true, None, &[], false).unwrap());
         assert_eq!(off["status"], "noop");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), NET_BOARD);
+    }
+
+    #[test]
+    fn generated_no_connect_names_can_swap_between_pads() {
+        let board = NET_BOARD
+            .replace("unconnected-(U601-A6-Pad8)", "unconnected-(U801-A6-Pad8)")
+            .replace("unconnected-(U701-A6-Pad8)", "unconnected-(U301-A6-Pad8)");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&path, &board).unwrap();
+        let design = net_design(true);
+        let dry = body(handle_with(&path, "n", &design, 1, true, None, &[], true).unwrap());
+        assert_eq!(dry["status"], "ready");
+        let revision = dry["plan_revision"].as_str();
+        let done = handle_with(&path, "n", &design, 1, false, revision, &[], true).unwrap();
+        assert_eq!(body(done)["status"], "applied");
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(
+            r#"(pad "8" smd rect (at 1 0) (net "unconnected-(U301-A6-Pad8)")) (future_token"#
+        ));
+        assert!(
+            saved.contains(r#"(pad "8" smd rect (at 1 0) (net "unconnected-(U801-A6-Pad8)"))))"#)
+        );
     }
 }
