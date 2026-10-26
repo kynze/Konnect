@@ -70,10 +70,22 @@ entries, non-finite numbers, footprints without a saved position and targets mor
 than 10 mm from the footprint are refused before any write. The plan revision
 covers the placements, and readback verifies each saved position.
 
-Generated net names containing previous references deliberately stay unchanged.
-Those names are internal net identities, not component reference fields. A
-subsequent full sync can still report their differences; that requires a separate
-reviewed net-name migration rather than relaxing routed-net guards.
+## Generated no-connect net names
+
+Unconnected pads get generated net names that embed a reference, for example
+`unconnected-(U601-A6-Pad8)`. After a reference migration the schematic generates
+`unconnected-(U301-A6-Pad8)`, and DRC with schematic parity reports a `net_conflict`
+for each. With `reference_only:true` and `rename_generated_nets:true`, the same
+revision-checked atomic transaction renames those pad nets. Only the quoted name in the
+pad's `(net "...")` is replaced, and only when both names are generated no-connect names that
+differ by the reference alone, the new reference is the footprint's current schematic
+reference, and the new name is unique. Any other difference between a pad's saved net and
+the schematic's is a conflict and nothing is written. The changes are listed in
+`reference_field_placements` with `kind: generated_net_name`; readback verifies each pad.
+
+Routed generated net names (`Net-(...)`) containing previous references stay unchanged,
+because they are internal net identities with copper attached; changing them needs a separate
+reviewed migration rather than relaxed routed-net guards.
 
 MEZZA-194 initially encountered 146 permutation refusals and two routed generated
 net-name refusals in the existing full-sync planner. Regression coverage includes

@@ -203,6 +203,7 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Matching .kicad_pcb; open for full sync, closed for reference_only" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "reference_only": { "type": "boolean", "description": "Rename UUID-linked references only; preserve all other fields and nets", "default": false },
+                    "rename_generated_nets": { "type": "boolean", "description": "With reference_only: also rename pad nets that are generated unconnected-(REF-...) names embedding a previous reference to the schematic's names; any other net difference is refused", "default": false },
                     "reference_field_placements": {
                         "type": "array",
                         "description": "With reference_only: move Reference fields to absolute board mm (x, y, optional absolute angle) by footprint UUID; footprints, pads and copper never move",

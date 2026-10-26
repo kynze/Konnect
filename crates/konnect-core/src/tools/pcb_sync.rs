@@ -384,7 +384,18 @@ pub(crate) async fn handle_update_pcb_from_schematic(
                 Err(error) => return Ok(CallToolResult::error(error.to_string())),
             },
         };
-        return saved_reference_sync::handle(
+        let rename_nets = match args.get("rename_generated_nets") {
+            None => false,
+            Some(value) => match value.as_bool() {
+                Some(value) => value,
+                None => {
+                    return Ok(CallToolResult::error(
+                        "rename_generated_nets must be boolean",
+                    ))
+                }
+            },
+        };
+        return saved_reference_sync::handle_with(
             &board,
             &netlist_source,
             &design,
@@ -392,7 +403,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             dry_run,
             expected_revision.as_deref(),
             &placements,
+            rename_nets,
         );
+    }
+    if args.get("rename_generated_nets").is_some() {
+        return Ok(CallToolResult::error(
+            "rename_generated_nets requires reference_only:true",
+        ));
     }
     if args.get("reference_field_placements").is_some() {
         return Ok(CallToolResult::error(
