@@ -203,6 +203,20 @@ pub fn tools() -> Vec<ToolDef> {
                     "board": { "type": "string", "description": "Matching .kicad_pcb; open for full sync, closed for reference_only" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
                     "reference_only": { "type": "boolean", "description": "Rename UUID-linked references only; preserve all other fields and nets", "default": false },
+                    "reference_field_placements": {
+                        "type": "array",
+                        "description": "With reference_only: move Reference fields to absolute board mm (x, y, optional absolute angle) by footprint UUID; footprints, pads and copper never move",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "footprint_uuid": { "type": "string" },
+                                "x": { "type": "number" },
+                                "y": { "type": "number" },
+                                "angle": { "type": "number" }
+                            },
+                            "required": ["footprint_uuid", "x", "y"]
+                        }
+                    },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
                 },
                 "required": ["schematic", "board"]
