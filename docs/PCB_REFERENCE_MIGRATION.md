@@ -48,6 +48,28 @@ metadata. Sources: [update handler](https://github.com/KiCad/kicad/blob/10.0.6/p
 Real-copy IPC attempts were refused/rolled back before this saved-file path was
 chosen; no real design was edited by those attempts.
 
+## Reference text placement
+
+Longer references can leave the Reference *text* over pads or other silkscreen.
+With `reference_only:true`, `reference_field_placements` moves chosen Reference
+fields in the same revision-checked atomic transaction (alone or with renames):
+
+```json
+"reference_field_placements": [
+  {"footprint_uuid": "0186ada2-...", "x": 130.7, "y": 99.018, "angle": 0}
+]
+```
+
+`x`/`y` are absolute board millimetres of the text anchor; the tool converts them
+to the footprint-local `(at ...)` using the saved footprint position and rotation
+(`angle` is the saved absolute text angle; omitted keeps the current one, and the
+angle token is kept only if the field already had one). Only that `(at ...)` span
+is replaced, so footprints, pads, copper, fills and every other byte are retained.
+Entries already at their target are a noop. Unknown footprint UUIDs, duplicate
+entries, non-finite numbers, footprints without a saved position and targets more
+than 10 mm from the footprint are refused before any write. The plan revision
+covers the placements, and readback verifies each saved position.
+
 Generated net names containing previous references deliberately stay unchanged.
 Those names are internal net identities, not component reference fields. A
 subsequent full sync can still report their differences; that requires a separate

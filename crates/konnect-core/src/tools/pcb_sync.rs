@@ -377,6 +377,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     }
 
     if reference_only {
+        let placements = match args.get("reference_field_placements") {
+            None => Vec::new(),
+            Some(value) => match saved_reference_sync::parse_placements(value) {
+                Ok(placements) => placements,
+                Err(error) => return Ok(CallToolResult::error(error.to_string())),
+            },
+        };
         return saved_reference_sync::handle(
             &board,
             &netlist_source,
@@ -384,7 +391,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
             hierarchy.len(),
             dry_run,
             expected_revision.as_deref(),
+            &placements,
         );
+    }
+    if args.get("reference_field_placements").is_some() {
+        return Ok(CallToolResult::error(
+            "reference_field_placements requires reference_only:true",
+        ));
     }
 
     let what = if dry_run {

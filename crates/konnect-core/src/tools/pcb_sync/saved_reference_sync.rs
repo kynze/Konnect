@@ -10,6 +10,91 @@ struct FootprintSpan {
     old: String,
     value_start: usize,
     value_end: usize,
+    at_start: usize,
+    at_end: usize,
+    at_old: String,
+    origin: Option<(f64, f64, f64)>,
+    angle: Option<f64>,
+}
+
+/// Absolute board placement of one Reference field; the footprint stays put.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct FieldPlacement {
+    pub footprint_uuid: String,
+    pub x: f64,
+    pub y: f64,
+    pub angle: Option<f64>,
+}
+
+const MAX_FIELD_DISTANCE_MM: f64 = 10.0;
+
+pub(super) fn parse_placements(value: &serde_json::Value) -> Result<Vec<FieldPlacement>> {
+    let items = value
+        .as_array()
+        .context("reference_field_placements must be an array")?;
+    let mut seen = HashSet::new();
+    let mut placements = Vec::new();
+    for item in items {
+        let number = |key: &str| {
+            item[key]
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .with_context(|| format!("placement {key} must be a finite number"))
+        };
+        let footprint_uuid = item["footprint_uuid"]
+            .as_str()
+            .context("placement footprint_uuid must be a string")?
+            .to_owned();
+        anyhow::ensure!(
+            seen.insert(footprint_uuid.clone()),
+            "Duplicate placement for footprint {footprint_uuid}"
+        );
+        let angle = match item.get("angle") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(v) => Some(
+                v.as_f64()
+                    .filter(|a| a.is_finite())
+                    .context("placement angle must be a finite number")?,
+            ),
+        };
+        placements.push(FieldPlacement {
+            footprint_uuid,
+            x: number("x")?,
+            y: number("y")?,
+            angle,
+        });
+    }
+    Ok(placements)
+}
+
+fn mm(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let text = text.trim_end_matches('0').trim_end_matches('.');
+    if text == "-0" || text.is_empty() {
+        "0".into()
+    } else {
+        text.into()
+    }
+}
+
+fn numbers(block: &str) -> Vec<f64> {
+    block
+        .trim_matches(|c| c == '(' || c == ')')
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|t| t.parse().ok())
+        .collect()
+}
+
+/// Footprint-local `(at ...)` text for an absolute field placement.
+fn local_at(origin: (f64, f64, f64), placement: &FieldPlacement, old_angle: Option<f64>) -> String {
+    let (dx, dy) = (placement.x - origin.0, placement.y - origin.1);
+    let (sin, cos) = origin.2.to_radians().sin_cos();
+    let local = (dx * cos - dy * sin, dx * sin + dy * cos);
+    match placement.angle.or(old_angle) {
+        Some(angle) => format!("(at {} {} {})", mm(local.0), mm(local.1), mm(angle)),
+        None => format!("(at {} {})", mm(local.0), mm(local.1)),
+    }
 }
 
 fn annotated(reference: &str) -> bool {
@@ -63,8 +148,29 @@ fn snapshot(source: &str) -> Result<(BoardState, Vec<FootprintSpan>)> {
         let offset = block[*a..*b]
             .find(&literal)
             .context("Reference value is not quoted")?;
+        let field_block = &block[*a..*b];
+        let (at_a, at_b) = find_direct_child_blocks(field_block, "property")
+            .into_iter()
+            .find(|(x, y)| {
+                konnect_sexp::parse_sexp(&field_block[*x..*y]).is_ok_and(|n| n.head() == Some("at"))
+            })
+            .context("Reference property has no position")?;
+        let at_old = field_block[at_a..at_b].to_owned();
+        let field_numbers = numbers(&at_old);
+        anyhow::ensure!(field_numbers.len() >= 2, "Reference position is malformed");
+        let origin = find_direct_child_blocks(block, "footprint")
+            .into_iter()
+            .map(|(x, y)| &block[x..y])
+            .find(|text| konnect_sexp::parse_sexp(text).is_ok_and(|n| n.head() == Some("at")))
+            .map(numbers)
+            .filter(|n| n.len() >= 2);
         spans.push(FootprintSpan {
             id: id.clone(),
+            at_start: start + a + at_a,
+            at_end: start + a + at_b,
+            origin: origin.map(|o| (o[0], o[1], o.get(2).copied().unwrap_or(0.0))),
+            angle: field_numbers.get(2).copied(),
+            at_old,
             old: old.clone(),
             value_start: start + a + offset + 1,
             value_end: start + a + offset + 1 + old.len(),
@@ -111,6 +217,7 @@ pub(super) fn handle(
     hierarchy: usize,
     dry_run: bool,
     revision: Option<&str>,
+    placements: &[FieldPlacement],
 ) -> Result<CallToolResult> {
     if kicad_editor_lock_path(board).is_some_and(|p| p.exists()) {
         return Ok(conflict_result(
@@ -129,19 +236,54 @@ pub(super) fn handle(
             }
         }
     }
+    // Placement edits: target `(at ...)` text per footprint, skipping no-ops.
+    let mut placement_edits = Vec::new();
+    let mut placement_report = Vec::new();
+    for placement in placements {
+        let Some(span) = spans.iter().find(|s| s.id == placement.footprint_uuid) else {
+            return Ok(conflict_result(format!(
+                "Placement names unknown footprint {}",
+                placement.footprint_uuid
+            )));
+        };
+        let Some(origin) = span.origin else {
+            return Ok(conflict_result(format!(
+                "Footprint {} has no saved position",
+                span.old
+            )));
+        };
+        let distance = (placement.x - origin.0).hypot(placement.y - origin.1);
+        if distance > MAX_FIELD_DISTANCE_MM {
+            return Ok(conflict_result(format!(
+                "Placement for {} is {distance:.2} mm from its footprint (limit {MAX_FIELD_DISTANCE_MM} mm)",
+                span.old
+            )));
+        }
+        let target = local_at(origin, placement, span.angle);
+        if numbers(&target) != numbers(&span.at_old) {
+            placement_report.push(serde_json::json!({
+                "footprint_uuid": span.id, "reference": span.old,
+                "from": span.at_old, "to": target,
+            }));
+            placement_edits.push((span.id.clone(), span.at_start, span.at_end, target));
+        }
+    }
     let mut hash = Sha256::new();
     hash.update(plan.plan_revision.as_bytes());
     hash.update(before.as_bytes());
+    for placement in placements {
+        hash.update(format!("{placement:?}").as_bytes());
+    }
     plan.plan_revision = format!("{:x}", hash.finalize());
     let status = if plan.status == PlanStatus::Conflict {
         "conflict"
-    } else if plan.changes.is_empty() {
+    } else if plan.changes.is_empty() && placement_edits.is_empty() {
         "noop"
     } else {
         "ready"
     };
     if dry_run || status == "conflict" {
-        return response(&plan, status, hierarchy, false);
+        return response(&plan, status, hierarchy, false, &placement_report);
     }
     if revision != Some(plan.plan_revision.as_str()) {
         return Ok(conflict_result(
@@ -149,7 +291,7 @@ pub(super) fn handle(
         ));
     }
     if status == "noop" {
-        return response(&plan, "noop", hierarchy, false);
+        return response(&plan, "noop", hierarchy, false, &placement_report);
     }
     let mut edits = Vec::new();
     for change in &plan.changes {
@@ -174,20 +316,43 @@ pub(super) fn handle(
             reference.clone(),
         ));
     }
+    for (_, start, end, target) in &placement_edits {
+        edits.push(SexpEdit::replace(*start, *end, target.clone()));
+    }
     let replacement = apply_edits(before.clone(), edits);
-    let (expected, _) = snapshot(&replacement)?;
+    let (expected, expected_spans) = snapshot(&replacement)?;
     verify_reference_state(&state, &expected, &plan.changes)?;
+    verify_placements(&expected_spans, &placement_edits)?;
     write_atomic_if_unchanged(board, &before, &replacement)?;
     let saved = read_consistent(board)?;
     anyhow::ensure!(
         saved == replacement,
         "Reference migration was written but readback differs; inspect before retrying"
     );
-    let (observed, _) = snapshot(&saved)?;
+    let (observed, observed_spans) = snapshot(&saved)?;
     verify_reference_state(&state, &observed, &plan.changes)?;
+    verify_placements(&observed_spans, &placement_edits)?;
     plan.counts.updated.applied = plan.counts.updated.planned;
     plan.counts.board_only_preserved.applied = plan.counts.board_only_preserved.planned;
-    response(&plan, "applied", hierarchy, true)
+    response(&plan, "applied", hierarchy, true, &placement_report)
+}
+
+fn verify_placements(
+    spans: &[FootprintSpan],
+    edits: &[(String, usize, usize, String)],
+) -> Result<()> {
+    for (id, _, _, target) in edits {
+        let span = spans
+            .iter()
+            .find(|s| &s.id == id)
+            .context("Placed footprint missing after edit")?;
+        anyhow::ensure!(
+            numbers(&span.at_old) == numbers(target),
+            "Reference placement for {} did not read back as planned",
+            span.old
+        );
+    }
+    Ok(())
 }
 
 fn response(
@@ -195,12 +360,14 @@ fn response(
     status: &str,
     hierarchy: usize,
     applied: bool,
+    placements: &[serde_json::Value],
 ) -> Result<CallToolResult> {
     let result = sync_response(plan, status, hierarchy, applied);
     let ToolContent::Text { text } = &result.content[0] else {
         bail!("Expected JSON sync response")
     };
     let mut value: serde_json::Value = serde_json::from_str(text)?;
+    value["reference_field_placements"] = serde_json::json!(placements);
     value["coverage"]["transport"] = serde_json::json!("saved_board_file");
     value["coverage"]["atomicity"] = serde_json::json!("revision_checked_atomic_file_replace");
     value["undo"] = serde_json::json!({"available":false,"reason":"closed-board reference-only file transaction"});
@@ -239,11 +406,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("board.kicad_pcb");
         std::fs::write(&path, BOARD).unwrap();
-        let dry = body(handle(&path, "netlist", &design(), 1, true, None).unwrap());
+        let dry = body(handle(&path, "netlist", &design(), 1, true, None, &[]).unwrap());
         let mut invalid = design();
         invalid.components[0].reference = "R?".into();
         assert_eq!(
-            body(handle(&path, "netlist", &invalid, 1, true, None).unwrap())["status"],
+            body(handle(&path, "netlist", &invalid, 1, true, None, &[]).unwrap())["status"],
             "conflict"
         );
         assert_eq!(dry["status"], "ready");
@@ -256,6 +423,7 @@ mod tests {
                 1,
                 false,
                 dry["plan_revision"].as_str(),
+                &[],
             )
             .unwrap(),
         );
@@ -274,7 +442,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("board.kicad_pcb");
         std::fs::write(&path, BOARD).unwrap();
-        let dry = body(handle(&path, "netlist", &design(), 1, true, None).unwrap());
+        let dry = body(handle(&path, "netlist", &design(), 1, true, None, &[]).unwrap());
         std::fs::write(&path, format!("{BOARD}\n")).unwrap();
         assert_eq!(
             body(
@@ -284,7 +452,8 @@ mod tests {
                     &design(),
                     1,
                     false,
-                    dry["plan_revision"].as_str()
+                    dry["plan_revision"].as_str(),
+                    &[]
                 )
                 .unwrap()
             )["status"],
@@ -293,9 +462,73 @@ mod tests {
         let lock = kicad_editor_lock_path(&path).unwrap();
         std::fs::write(lock, "test").unwrap();
         assert_eq!(
-            body(handle(&path, "netlist", &design(), 1, true, None).unwrap())["status"],
+            body(handle(&path, "netlist", &design(), 1, true, None, &[]).unwrap())["status"],
             "conflict"
         );
         assert_eq!(std::fs::read_to_string(path).unwrap(), format!("{BOARD}\n"));
+    }
+
+    fn placement(uuid: &str, x: f64, y: f64) -> FieldPlacement {
+        FieldPlacement {
+            footprint_uuid: uuid.into(),
+            x,
+            y,
+            angle: None,
+        }
+    }
+    const ROTATED: &str = r#"(kicad_pcb (footprint "R" (at 109.7026 74.757224 135) (uuid "a") (path "/a") (property "Reference" "R1" (at -0.804671 1.817564 0) (layer "F.SilkS") (effects (font (size 0.8 0.8)))) (property "Value" "x" (at 0 1 135))) (footprint "R" (at 130 90 90) (uuid "b") (path "/b") (property "Reference" "R2" (at 2.3 0 90) (layer "B.SilkS"))))"#;
+    fn same_references() -> ExportedDesign {
+        let mut design = design();
+        design.components[0].reference = "R1".into();
+        design.components[1].reference = "R2".into();
+        design.components[0].symbol_path = "/a".into();
+        design.components[1].symbol_path = "/b".into();
+        design
+    }
+    #[test]
+    fn field_placement_converts_world_to_local_and_changes_only_that_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&path, ROTATED).unwrap();
+        let placements = [placement("a", 110.0, 75.0), placement("b", 130.0, 87.0)];
+        let dry = body(handle(&path, "n", &same_references(), 1, true, None, &placements).unwrap());
+        assert_eq!(dry["status"], "ready");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ROTATED);
+        let revision = dry["plan_revision"].as_str();
+        let applied = handle(
+            &path,
+            "n",
+            &same_references(),
+            1,
+            false,
+            revision,
+            &placements,
+        )
+        .unwrap();
+        assert_eq!(body(applied)["status"], "applied");
+        // Offsets computed independently of the implementation; every other byte is unchanged.
+        let expected = ROTATED
+            .replace("(at -0.804671 1.817564 0)", "(at -0.381962 0.038625 0)")
+            .replace("(at 2.3 0 90)", "(at 3 0 90)");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+        let again =
+            body(handle(&path, "n", &same_references(), 1, true, None, &placements).unwrap());
+        assert_eq!(again["status"], "noop");
+    }
+    #[test]
+    fn field_placement_refuses_unknown_distant_and_duplicate_targets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&path, ROTATED).unwrap();
+        for bad in [placement("zzz", 109.0, 74.0), placement("a", 140.0, 74.0)] {
+            let result = handle(&path, "n", &same_references(), 1, true, None, &[bad]).unwrap();
+            assert_eq!(body(result)["status"], "conflict");
+        }
+        let duplicate = serde_json::json!([{"footprint_uuid":"a","x":1,"y":2},{"footprint_uuid":"a","x":1,"y":2}]);
+        assert!(parse_placements(&duplicate).is_err());
+        assert!(
+            parse_placements(&serde_json::json!([{"footprint_uuid":"a","x":"1","y":2}])).is_err()
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), ROTATED);
     }
 }
