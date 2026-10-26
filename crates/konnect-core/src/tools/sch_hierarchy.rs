@@ -1612,6 +1612,16 @@ pub(crate) fn build_hierarchy_node(
     depth: usize,
     visited: &mut HashSet<PathBuf>,
 ) -> anyhow::Result<Value> {
+    build_hierarchy_instance_node(path, project_name, None, depth, visited)
+}
+
+fn build_hierarchy_instance_node(
+    path: &Path,
+    project_name: &str,
+    instance_path: Option<&str>,
+    depth: usize,
+    visited: &mut HashSet<PathBuf>,
+) -> anyhow::Result<Value> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     if depth > MAX_HIERARCHY_DEPTH {
@@ -1641,13 +1651,29 @@ pub(crate) fn build_hierarchy_node(
         }
     };
 
+    let root_prefix = sch.uuid.as_ref().map(|uuid| format!("/{uuid}"));
+    let instance_path = instance_path.or(root_prefix.as_deref()).unwrap_or("");
     let dir = parent_dir(path);
     let mut children = Vec::new();
     for sheet in sch.sheets.iter() {
         let child_path = dir.join(sheet.file());
         let mut node = sheet_json(sheet, project_name);
+        node["page"] =
+            json!(sheet
+                .instances
+                .iter()
+                .find(|instance| instance.project_name == project_name
+                    && instance.path == instance_path)
+                .map(|instance| instance.page.as_str()));
         if child_path.exists() {
-            let sub = build_hierarchy_node(&child_path, project_name, depth + 1, visited)?;
+            let child_prefix = format!("{instance_path}/{}", sheet.uuid);
+            let sub = build_hierarchy_instance_node(
+                &child_path,
+                project_name,
+                Some(&child_prefix),
+                depth + 1,
+                visited,
+            )?;
             node["children"] = sub["children"].clone();
             if let Some(err) = sub.get("error") {
                 node["error"] = err.clone();
@@ -1692,7 +1718,7 @@ async fn handle_renumber_sheet_pages(
     let mut next_page = 2u32; // page 1 is always the root, left untouched
     let mut renumbered = Vec::new();
     let mut visited = HashSet::new();
-    let mut transitions = Vec::new();
+    let mut pending = HashMap::new();
     collect_renumber_transitions(
         &root_path,
         &root_prefix,
@@ -1701,8 +1727,14 @@ async fn handle_renumber_sheet_pages(
         &mut renumbered,
         &mut visited,
         Some((&root_before, &root_base, &root_uuid)),
-        &mut transitions,
+        &mut pending,
     )?;
+    let mut transitions: Vec<_> = pending
+        .into_values()
+        .filter(|(_, before, after)| before != after)
+        .map(|(path, before, after)| FileTransition::replace(path, before, after))
+        .collect();
+    transitions.sort_by(|a, b| a.path().cmp(b.path()));
     if !transitions.is_empty() {
         commit_file_transaction(parent_dir(&root_path), transitions)?;
     }
@@ -1722,7 +1754,7 @@ fn collect_renumber_transitions(
     renumbered: &mut Vec<Value>,
     visited: &mut HashSet<PathBuf>,
     source_override: Option<(&str, &str, &str)>,
-    transitions: &mut Vec<FileTransition>,
+    pending: &mut HashMap<PathBuf, (PathBuf, String, String)>,
 ) -> anyhow::Result<()> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canon.clone()) {
@@ -1732,10 +1764,14 @@ fn collect_renumber_transitions(
     let loaded_before = source_override
         .map(|(before, _, _)| before.to_owned())
         .unwrap_or(read_consistent(path)?);
+    let (original, current) = pending
+        .get(&canon)
+        .map(|(_, original, current)| (original.clone(), current.clone()))
+        .unwrap_or_else(|| (loaded_before.clone(), loaded_before.clone()));
     let command_source = source_override
         .map(|(_, base, _)| base)
-        .unwrap_or(loaded_before.as_str());
-    let mut sch = cse::Schematic::load(path)?;
+        .unwrap_or(current.as_str());
+    let mut sch = cse::Schematic::from_source(path, command_source)?;
     if let Some((_, _, root_uuid)) = source_override {
         sch.uuid = Some(root_uuid.to_owned());
     }
@@ -1753,7 +1789,14 @@ fn collect_renumber_transitions(
         let page = next_page.to_string();
         *next_page += 1;
         if let Some(sheet) = sch.sheets.by_name_mut(name) {
-            if sheet.page(project_name) != Some(page.as_str()) {
+            let existing_page = sheet
+                .instances
+                .iter()
+                .find(|instance| {
+                    instance.project_name == project_name && instance.path == hier_prefix
+                })
+                .map(|instance| instance.page.as_str());
+            if existing_page != Some(page.as_str()) {
                 sheet.set_page(project_name, hier_prefix, &page);
                 changed_ids.push(ItemId::new(sheet.uuid.clone())?);
             }
@@ -1771,7 +1814,7 @@ fn collect_renumber_transitions(
                 renumbered,
                 visited,
                 None,
-                transitions,
+                pending,
             )?;
         }
     }
@@ -1787,9 +1830,7 @@ fn collect_renumber_transitions(
         )?;
         prepare_command(path, command_source, &command)?.0
     };
-    if replacement != loaded_before {
-        transitions.push(FileTransition::replace(path, loaded_before, replacement));
-    }
+    pending.insert(canon.clone(), (path.to_path_buf(), original, replacement));
     visited.remove(&canon);
     Ok(())
 }
@@ -3212,6 +3253,85 @@ mod tests {
         };
         let tree: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(tree["children"][0]["error"], "child file not found on disk");
+    }
+
+    #[tokio::test]
+    async fn repeated_sheet_pages_are_renumbered_and_read_by_instance() {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        let ctx = test_ctx();
+        for name in ["A", "B"] {
+            let result = handle_add_hierarchical_sheet(
+                &json!({ "schematic": root.display().to_string(),
+                    "sheet_file": "shared.kicad_sch", "sheet_name": name }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+            assert!(!result.is_error);
+        }
+        let shared = tmp.path().join("shared.kicad_sch");
+        let result = handle_add_hierarchical_sheet(
+            &json!({ "schematic": shared.display().to_string(),
+                "sheet_file": "leaf.kicad_sch", "sheet_name": "Leaf",
+                "project_name": "root" }),
+            &ctx,
+        )
+        .await
+        .unwrap();
+        assert!(!result.is_error);
+        let parent = cse::Schematic::load(&root).unwrap();
+        let root_uuid = parent.uuid.as_ref().unwrap();
+        let a_path = format!(
+            "/{}/{}",
+            root_uuid,
+            parent.sheets.by_name("A").unwrap().uuid
+        );
+        let b_path = format!(
+            "/{}/{}",
+            root_uuid,
+            parent.sheets.by_name("B").unwrap().uuid
+        );
+        let mut child = cse::Schematic::load(&shared).unwrap();
+        let leaf = child.sheets.by_name_mut("Leaf").unwrap();
+        leaf.set_page("root", &a_path, "20");
+        leaf.set_page("root", &b_path, "30");
+        leaf.set_page("other-project", "/other", "99");
+        child.overwrite().unwrap();
+
+        let result =
+            handle_get_sheet_hierarchy(&json!({ "schematic": root.display().to_string() }), &ctx)
+                .await
+                .unwrap();
+        let text = match &result.content[0] {
+            crate::mcp::protocol::ToolContent::Text { text } => text,
+            _ => panic!("expected text"),
+        };
+        let tree: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(tree["children"][0]["children"][0]["page"], "20");
+        assert_eq!(tree["children"][1]["children"][0]["page"], "30");
+
+        handle_renumber_sheet_pages(&json!({ "schematic": root.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        let child = cse::Schematic::load(&shared).unwrap();
+        let leaf = child.sheets.by_name("Leaf").unwrap();
+        for (path, page) in [(&a_path, "3"), (&b_path, "5")] {
+            assert_eq!(
+                leaf.instances
+                    .iter()
+                    .find(|i| i.project_name == "root" && i.path == *path)
+                    .unwrap()
+                    .page,
+                page
+            );
+        }
+        assert_eq!(leaf.page("other-project"), Some("99"));
+        let before = std::fs::read(&shared).unwrap();
+        handle_renumber_sheet_pages(&json!({ "schematic": root.display().to_string() }), &ctx)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&shared).unwrap(), before);
     }
 
     #[tokio::test]
