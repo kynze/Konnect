@@ -185,6 +185,8 @@ pub fn tools() -> Vec<ToolDef> {
         tool!(
             "update_pcb_from_schematic",
             "Plan or atomically apply saved schematic hierarchy changes to the live KiCad PCB. \
+             Optional reference_only requires a closed PCB and atomically edits saved UUID-linked references, allowing \
+             simultaneous swaps while preserving other footprint fields and all pad nets. \
              Defaults to a non-mutating dry run; apply requires its exact plan revision. \
              Preserves placement, routing, board-only footprints, and footprint artwork. \
              A symbol with no footprint assigned is reported under `unassigned_footprints` \
@@ -198,8 +200,9 @@ pub fn tools() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Saved root .kicad_sch path" },
-                    "board": { "type": "string", "description": "Matching .kicad_pcb path currently open in KiCad" },
+                    "board": { "type": "string", "description": "Matching .kicad_pcb; open for full sync, closed for reference_only" },
                     "dry_run": { "type": "boolean", "description": "Plan without changing the board", "default": true },
+                    "reference_only": { "type": "boolean", "description": "Rename UUID-linked references only; preserve all other fields and nets", "default": false },
                     "expected_plan_revision": { "type": "string", "description": "Required for apply; exact revision returned by the latest dry run" }
                 },
                 "required": ["schematic", "board"]

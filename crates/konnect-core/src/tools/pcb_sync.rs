@@ -19,6 +19,8 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 // Count bound only: this does not claim a byte-size or listener-size limit.
+mod saved_reference_sync;
+
 const SYNC_CREATE_CHUNK_SIZE: usize = 32;
 
 fn create_sync_items_in(
@@ -167,6 +169,10 @@ struct PreservedBoardState {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PlannedChange {
+    Rename {
+        kiid: String,
+        reference: String,
+    },
     Add {
         reference: String,
         value: String,
@@ -300,6 +306,13 @@ pub(crate) async fn handle_update_pcb_from_schematic(
     let schematic = crate::tools::get_path(args, "schematic")?;
     let board = crate::tools::get_path(args, "board")?;
     let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let reference_only = match args.get("reference_only") {
+        None => false,
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return Ok(CallToolResult::error("reference_only must be boolean")),
+        },
+    };
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -363,6 +376,17 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         )));
     }
 
+    if reference_only {
+        return saved_reference_sync::handle(
+            &board,
+            &netlist_source,
+            &design,
+            hierarchy.len(),
+            dry_run,
+            expected_revision.as_deref(),
+        );
+    }
+
     let what = if dry_run {
         "PCB sync dry run"
     } else {
@@ -376,7 +400,9 @@ pub(crate) async fn handle_update_pcb_from_schematic(
         what,
         move |client| {
             let snapshot = snapshot_board(client, &ipc_board)?;
-            let mut plan = plan_sync(&netlist_source, &design, &snapshot.state);
+            let mut plan = if reference_only {
+                plan_reference_sync(&netlist_source, &design, &snapshot.state)
+            } else { plan_sync(&netlist_source, &design, &snapshot.state) };
             plan.staging = Some(snapshot.staging.clone());
             let (prepared, unprepared) = prepare_additions(&library_board, &plan);
             // Everything that would fail the apply is found here, so `ready`
@@ -2283,6 +2309,9 @@ fn build_mutation_items(
                     .with_context(|| format!("no prepared footprint for {footprint_id}"))?;
                 creates.push(build_added_footprint(change, part, &snapshot.net_codes)?);
             }
+            PlannedChange::Rename { .. } => {
+                bail!("Saved-board reference changes cannot use live footprint replacement")
+            }
             PlannedChange::Update { kiid, .. } => {
                 let item = snapshot
                     .items
@@ -2672,6 +2701,116 @@ mod chunk_tests {
     }
 }
 
+fn plan_reference_sync(source: &str, design: &ExportedDesign, board: &BoardState) -> SyncPlan {
+    let mut plan = SyncPlan {
+        status: PlanStatus::Noop,
+        plan_revision: format!("reference_only:{}", plan_revision(source, board)),
+        counts: SyncCounts::default(),
+        changes: Vec::new(),
+        diagnostics: Vec::new(),
+        unassigned: Vec::new(),
+        staging: None,
+    };
+    let mut matched = HashSet::new();
+    let mut proposed = HashMap::new();
+    for component in &design.components {
+        let candidates: Vec<_> = board
+            .footprints
+            .iter()
+            .filter(|fp| fp.symbol_path.as_deref() == Some(component.symbol_path.as_str()))
+            .collect();
+        if candidates.len() != 1 || !matched.insert(component.symbol_path.clone()) {
+            plan.diagnostics.push(conflict(
+                "reference_only_identity_conflict",
+                "Reference-only sync requires one existing footprint per exact symbol UUID path"
+                    .into(),
+                Some(&component.reference),
+            ));
+            continue;
+        }
+        let footprint = candidates[0];
+        proposed.insert(footprint.kiid.as_str(), component.reference.as_str());
+        if footprint.reference != component.reference {
+            plan.changes.push(PlannedChange::Rename {
+                kiid: footprint.kiid.clone(),
+                reference: component.reference.clone(),
+            });
+        }
+    }
+    // Validate simultaneous final names, including retained board-only items.
+    let mut final_references = HashSet::new();
+    for footprint in &board.footprints {
+        let reference = proposed
+            .get(footprint.kiid.as_str())
+            .copied()
+            .unwrap_or(&footprint.reference);
+        if !final_references.insert(reference) {
+            plan.diagnostics.push(conflict(
+                "reference_rename_collision",
+                "Reference-only sync would leave duplicate references".into(),
+                Some(reference),
+            ));
+        }
+    }
+    if !design.unassigned.is_empty() {
+        plan.diagnostics.push(conflict(
+            "reference_only_unassigned_footprint",
+            "Reference-only sync requires assigned footprints; no footprint will be added".into(),
+            None,
+        ));
+    }
+    plan.counts.board_only_preserved.planned = board.footprints.len().saturating_sub(matched.len());
+    plan.counts.skipped_by_flag.planned = design.skipped.len();
+    plan.counts.conflicts.planned = plan.diagnostics.len();
+    if !plan.diagnostics.is_empty() {
+        plan.status = PlanStatus::Conflict;
+        plan.changes.clear();
+    } else if !plan.changes.is_empty() {
+        plan.status = PlanStatus::Ready;
+        plan.counts.updated.planned = plan.changes.len();
+    }
+    plan
+}
+
+fn verify_reference_state(
+    before: &BoardState,
+    after: &BoardState,
+    changes: &[PlannedChange],
+) -> Result<()> {
+    let mut expected = before.footprints.clone();
+    for change in changes {
+        let PlannedChange::Rename { kiid, reference } = change else {
+            bail!("non-reference change in reference-only plan")
+        };
+        let footprint = expected
+            .iter_mut()
+            .find(|f| &f.kiid == kiid)
+            .context("planned footprint missing from baseline")?;
+        footprint.reference = reference.clone();
+    }
+    let mut observed = after.footprints.clone();
+    expected.sort_by(|a, b| a.kiid.cmp(&b.kiid));
+    observed.sort_by(|a, b| a.kiid.cmp(&b.kiid));
+    if expected != observed {
+        let difference = expected.iter().zip(&observed).find(|(a, b)| a != b);
+        bail!(
+            "reference-only footprint readback differs ({} expected/{} observed): {difference:?}",
+            expected.len(),
+            observed.len()
+        );
+    }
+    if before.routed_nets != after.routed_nets {
+        let differences: Vec<_> = before
+            .routed_nets
+            .iter()
+            .filter(|(name, count)| after.routed_nets.get(*name) != Some(*count))
+            .take(4)
+            .collect();
+        bail!("reference-only routed-net readback differs: {differences:?}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2692,6 +2831,78 @@ mod tests {
     (net (code "2") (name "GND") (class "Default")
       (node (ref "R1") (pin "2") (pintype "passive")))))
 "#;
+
+    #[test]
+    fn reference_only_sync_handles_swaps_without_other_field_changes() {
+        let mut first = resistor("R2", "/sheet/a");
+        first.value = "unrelated new value".into();
+        first.dnp = true;
+        first.pad_nets = BTreeMap::from([("1".into(), "different net".into())]);
+        let design = ExportedDesign {
+            components: vec![first, resistor("R1", "/sheet/b")],
+            skipped: vec![],
+            unassigned: vec![],
+        };
+        let mut board = board_with(vec![
+            board_resistor("R1", Some("/sheet/a")),
+            board_resistor("R2", Some("/sheet/b")),
+        ]);
+        board.footprints[1].kiid = "second-kiid".into();
+        let plan = plan_reference_sync("netlist", &design, &board);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.counts.updated.planned, 2);
+        assert_eq!(plan.counts.pads_reassigned.planned, 0);
+        assert_eq!(plan.counts.added.planned, 0);
+        assert!(plan
+            .changes
+            .iter()
+            .all(|c| serde_json::to_value(c).unwrap()["kind"] == "rename"));
+    }
+
+    #[test]
+    fn reference_only_sync_refuses_unmatched_identities_and_final_collisions() {
+        let mut board = board_with(vec![
+            board_resistor("R1", Some("/sheet/a")),
+            board_resistor("R2", None),
+        ]);
+        board.footprints[1].kiid = "board-only-kiid".into();
+        for component in [resistor("R2", "/sheet/a"), resistor("R3", "/missing")] {
+            let design = ExportedDesign {
+                components: vec![component],
+                skipped: vec![],
+                unassigned: vec![],
+            };
+            let plan = plan_reference_sync("netlist", &design, &board);
+            assert_eq!(plan.status, PlanStatus::Conflict);
+            assert!(plan.changes.is_empty());
+        }
+    }
+
+    #[test]
+    fn reference_only_readback_refuses_ignored_or_misassigned_renames() {
+        let before = board_with(vec![
+            board_resistor("R1", Some("/a")),
+            board_resistor("R2", Some("/b")),
+        ]);
+        let changes = vec![
+            PlannedChange::Rename {
+                kiid: "R1-kiid".into(),
+                reference: "R2".into(),
+            },
+            PlannedChange::Rename {
+                kiid: "R2-kiid".into(),
+                reference: "R1".into(),
+            },
+        ];
+        assert!(verify_reference_state(&before, &before, &changes).is_err());
+        let mut correct = before.clone();
+        correct.footprints[0].reference = "R2".into();
+        correct.footprints[1].reference = "R1".into();
+        assert!(verify_reference_state(&before, &correct, &changes).is_ok());
+        let mut altered = correct.clone();
+        altered.footprints[0].value = "unrelated change".into();
+        assert!(verify_reference_state(&before, &altered, &changes).is_err());
+    }
 
     #[test]
     fn exported_netlist_is_one_flattened_source_of_component_and_pad_truth() {
