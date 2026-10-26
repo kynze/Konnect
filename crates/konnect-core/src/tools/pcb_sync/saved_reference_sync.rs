@@ -15,6 +15,16 @@ struct FootprintSpan {
     at_old: String,
     origin: Option<(f64, f64, f64)>,
     angle: Option<f64>,
+    symbol_path: Option<String>,
+    pads: Vec<PadNetSpan>,
+}
+
+/// Saved net name of one pad: the quoted text inside its `(net "...")`.
+struct PadNetSpan {
+    number: String,
+    start: usize,
+    end: usize,
+    name: String,
 }
 
 /// Absolute board placement of one Reference field; the footprint stays put.
@@ -164,8 +174,45 @@ fn snapshot(source: &str) -> Result<(BoardState, Vec<FootprintSpan>)> {
             .find(|text| konnect_sexp::parse_sexp(text).is_ok_and(|n| n.head() == Some("at")))
             .map(numbers)
             .filter(|n| n.len() >= 2);
+        let mut pads = Vec::new();
+        for (pa, pb) in find_direct_child_blocks(block, "footprint") {
+            let pad_text = &block[pa..pb];
+            let Ok(pad) = konnect_sexp::parse_sexp(pad_text) else {
+                continue;
+            };
+            if pad.head() != Some("pad") {
+                continue;
+            }
+            let Some(number) = pad.get(1).and_then(SexpNode::as_str) else {
+                continue;
+            };
+            for (na, nb) in find_direct_child_blocks(pad_text, "pad") {
+                let net_text = &pad_text[na..nb];
+                if !net_text.starts_with("(net") {
+                    continue;
+                }
+                let (Some(open), Some(close)) = (net_text.find('"'), net_text.rfind('"')) else {
+                    continue;
+                };
+                let name = &net_text[open + 1..close];
+                if close <= open || name.contains(['"', '\\']) {
+                    continue;
+                }
+                pads.push(PadNetSpan {
+                    number: number.to_owned(),
+                    start: start + pa + na + open + 1,
+                    end: start + pa + na + close,
+                    name: name.to_owned(),
+                });
+            }
+        }
         spans.push(FootprintSpan {
             id: id.clone(),
+            symbol_path: node
+                .find_str("path")
+                .filter(|p| !p.is_empty() && *p != "/")
+                .map(str::to_owned),
+            pads,
             at_start: start + a + at_a,
             at_end: start + a + at_b,
             origin: origin.map(|o| (o[0], o[1], o.get(2).copied().unwrap_or(0.0))),
@@ -210,6 +257,7 @@ fn snapshot(source: &str) -> Result<(BoardState, Vec<FootprintSpan>)> {
     ))
 }
 
+#[cfg(test)]
 pub(super) fn handle(
     board: &Path,
     netlist: &str,
@@ -218,6 +266,111 @@ pub(super) fn handle(
     dry_run: bool,
     revision: Option<&str>,
     placements: &[FieldPlacement],
+) -> Result<CallToolResult> {
+    handle_with(
+        board, netlist, design, hierarchy, dry_run, revision, placements, false,
+    )
+}
+
+/// One planned pad net rename: byte span of the quoted name plus old and new text.
+struct NetEdit {
+    start: usize,
+    end: usize,
+    to: String,
+    from: String,
+    pad: String,
+}
+
+/// `unconnected-(REF-REST)` split into its reference and the rest.
+fn generated_no_connect(name: &str) -> Option<(&str, &str)> {
+    let inner = name.strip_prefix("unconnected-(")?.strip_suffix(')')?;
+    inner.split_once('-')
+}
+
+/// Planned net-name edits for pads whose saved generated no-connect name still
+/// embeds a previous reference. Anything else that differs is a refusal.
+fn plan_generated_net_names(
+    design: &ExportedDesign,
+    spans: &[FootprintSpan],
+) -> std::result::Result<Vec<NetEdit>, String> {
+    let mut edits = Vec::new();
+    for span in spans {
+        let Some(component) = span.symbol_path.as_deref().and_then(|path| {
+            design
+                .components
+                .iter()
+                .find(|component| component.symbol_path == path)
+        }) else {
+            continue;
+        };
+        for pad in &span.pads {
+            let Some(expected) = component.pad_nets.get(&pad.number) else {
+                continue;
+            };
+            if *expected == pad.name {
+                continue;
+            }
+            let renamed = match (
+                generated_no_connect(&pad.name),
+                generated_no_connect(expected),
+            ) {
+                (Some((old_ref, old_rest)), Some((new_ref, new_rest))) => {
+                    old_ref != new_ref
+                        && old_rest == new_rest
+                        && new_ref == component.reference
+                        && annotated(old_ref)
+                        && annotated(new_ref)
+                }
+                _ => false,
+            };
+            if !renamed {
+                return Err(format!(
+                    "Pad {} of {} has net {:?} but the schematic gives {:?}; only generated no-connect names that differ by reference can be renamed",
+                    pad.number, component.reference, pad.name, expected
+                ));
+            }
+            edits.push(NetEdit {
+                start: pad.start,
+                end: pad.end,
+                to: expected.clone(),
+                from: pad.name.clone(),
+                pad: format!("{}/{}", component.reference, pad.number),
+            });
+        }
+    }
+    // Final names must be unique and must not land on a net the board already uses.
+    let renamed_old: HashSet<&str> = edits.iter().map(|e| e.from.as_str()).collect();
+    let mut final_names: HashMap<&str, usize> = HashMap::new();
+    for span in spans {
+        for pad in &span.pads {
+            if !renamed_old.contains(pad.name.as_str()) {
+                *final_names.entry(pad.name.as_str()).or_default() += 1;
+            }
+        }
+    }
+    for edit in &edits {
+        *final_names.entry(edit.to.as_str()).or_default() += 1;
+    }
+    if let Some((name, _)) = final_names.iter().find(|(name, n)| {
+        **n > 1 && name.starts_with("unconnected-(") && edits.iter().any(|e| e.to == **name)
+    }) {
+        return Err(format!(
+            "Net name {name:?} would be used by more than one pad"
+        ));
+    }
+    Ok(edits)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn handle_with(
+    board: &Path,
+    netlist: &str,
+    design: &ExportedDesign,
+    hierarchy: usize,
+    dry_run: bool,
+    revision: Option<&str>,
+    placements: &[FieldPlacement],
+    rename_nets: bool,
 ) -> Result<CallToolResult> {
     if kicad_editor_lock_path(board).is_some_and(|p| p.exists()) {
         return Ok(conflict_result(
@@ -268,16 +421,29 @@ pub(super) fn handle(
             placement_edits.push((span.id.clone(), span.at_start, span.at_end, target));
         }
     }
+    let mut net_edits = Vec::new();
+    if rename_nets {
+        match plan_generated_net_names(design, &spans) {
+            Ok(edits) => net_edits = edits,
+            Err(message) => return Ok(conflict_result(message)),
+        }
+        for edit in &net_edits {
+            placement_report.push(serde_json::json!({
+                "kind": "generated_net_name", "pad": edit.pad, "from": edit.from, "to": edit.to,
+            }));
+        }
+    }
     let mut hash = Sha256::new();
     hash.update(plan.plan_revision.as_bytes());
     hash.update(before.as_bytes());
     for placement in placements {
         hash.update(format!("{placement:?}").as_bytes());
     }
+    hash.update(format!("rename_nets={rename_nets}").as_bytes());
     plan.plan_revision = format!("{:x}", hash.finalize());
     let status = if plan.status == PlanStatus::Conflict {
         "conflict"
-    } else if plan.changes.is_empty() && placement_edits.is_empty() {
+    } else if plan.changes.is_empty() && placement_edits.is_empty() && net_edits.is_empty() {
         "noop"
     } else {
         "ready"
@@ -319,10 +485,18 @@ pub(super) fn handle(
     for (_, start, end, target) in &placement_edits {
         edits.push(SexpEdit::replace(*start, *end, target.clone()));
     }
+    for edit in &net_edits {
+        anyhow::ensure!(
+            before[edit.start..edit.end] == edit.from,
+            "Stale pad net span"
+        );
+        edits.push(SexpEdit::replace(edit.start, edit.end, edit.to.clone()));
+    }
     let replacement = apply_edits(before.clone(), edits);
     let (expected, expected_spans) = snapshot(&replacement)?;
     verify_reference_state(&state, &expected, &plan.changes)?;
     verify_placements(&expected_spans, &placement_edits)?;
+    verify_net_names(&expected_spans, &net_edits)?;
     write_atomic_if_unchanged(board, &before, &replacement)?;
     let saved = read_consistent(board)?;
     anyhow::ensure!(
@@ -332,9 +506,29 @@ pub(super) fn handle(
     let (observed, observed_spans) = snapshot(&saved)?;
     verify_reference_state(&state, &observed, &plan.changes)?;
     verify_placements(&observed_spans, &placement_edits)?;
+    verify_net_names(&observed_spans, &net_edits)?;
     plan.counts.updated.applied = plan.counts.updated.planned;
     plan.counts.board_only_preserved.applied = plan.counts.board_only_preserved.planned;
     response(&plan, "applied", hierarchy, true, &placement_report)
+}
+
+fn verify_net_names(spans: &[FootprintSpan], edits: &[NetEdit]) -> Result<()> {
+    for NetEdit { to, from, pad, .. } in edits {
+        let renamed = spans
+            .iter()
+            .flat_map(|span| &span.pads)
+            .filter(|p| p.name == *to)
+            .count();
+        let stale = spans
+            .iter()
+            .flat_map(|span| &span.pads)
+            .any(|p| p.name == *from);
+        anyhow::ensure!(
+            renamed == 1 && !stale,
+            "Generated net name for {pad} did not read back as planned"
+        );
+    }
+    Ok(())
 }
 
 fn verify_placements(
@@ -530,5 +724,77 @@ mod tests {
             parse_placements(&serde_json::json!([{"footprint_uuid":"a","x":"1","y":2}])).is_err()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), ROTATED);
+    }
+
+    const NET_BOARD: &str = r#"(kicad_pcb (footprint "U" (at 1 2) (uuid "u") (path "/u") (property "Reference" "U301" (at 0 0)) (pad "1" smd rect (at 0 0) (net "GND")) (pad "8" smd rect (at 1 0) (net "unconnected-(U601-A6-Pad8)")) (future_token "untouched")) (footprint "U" (at 5 2) (uuid "v") (path "/v") (property "Reference" "U801" (at 0 0)) (pad "8" smd rect (at 1 0) (net "unconnected-(U701-A6-Pad8)"))))"#;
+    fn net_design(rest_ok: bool) -> ExportedDesign {
+        let component = |reference: &str, path: &str, nets: &[(&str, &str)]| DesignComponent {
+            reference: reference.into(),
+            symbol_path: path.into(),
+            value: "ignored".into(),
+            footprint_id: "ignored".into(),
+            dnp: false,
+            pad_nets: nets
+                .iter()
+                .map(|(p, n)| (p.to_string(), n.to_string()))
+                .collect(),
+        };
+        let second = if rest_ok {
+            "unconnected-(U801-A6-Pad8)"
+        } else {
+            "unconnected-(U801-A7-Pad8)"
+        };
+        ExportedDesign {
+            components: vec![
+                component(
+                    "U301",
+                    "/u",
+                    &[("1", "GND"), ("8", "unconnected-(U301-A6-Pad8)")],
+                ),
+                component("U801", "/v", &[("8", second)]),
+            ],
+            skipped: vec![],
+            unassigned: vec![],
+        }
+    }
+    #[test]
+    fn generated_no_connect_names_follow_the_reference_and_nothing_else_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&path, NET_BOARD).unwrap();
+        let dry =
+            body(handle_with(&path, "n", &net_design(true), 1, true, None, &[], true).unwrap());
+        assert_eq!(dry["status"], "ready");
+        assert_eq!(
+            dry["reference_field_placements"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), NET_BOARD);
+        let revision = dry["plan_revision"].as_str();
+        let done =
+            handle_with(&path, "n", &net_design(true), 1, false, revision, &[], true).unwrap();
+        assert_eq!(body(done)["status"], "applied");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            NET_BOARD
+                .replace("unconnected-(U601-A6-Pad8)", "unconnected-(U301-A6-Pad8)")
+                .replace("unconnected-(U701-A6-Pad8)", "unconnected-(U801-A6-Pad8)")
+        );
+        let again =
+            body(handle_with(&path, "n", &net_design(true), 1, true, None, &[], true).unwrap());
+        assert_eq!(again["status"], "noop");
+    }
+    #[test]
+    fn net_rename_refuses_unrelated_differences_and_does_nothing_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.kicad_pcb");
+        std::fs::write(&path, NET_BOARD).unwrap();
+        let refused =
+            handle_with(&path, "n", &net_design(false), 1, true, None, &[], true).unwrap();
+        assert_eq!(body(refused)["status"], "conflict");
+        let off =
+            body(handle_with(&path, "n", &net_design(true), 1, true, None, &[], false).unwrap());
+        assert_eq!(off["status"], "noop");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), NET_BOARD);
     }
 }
