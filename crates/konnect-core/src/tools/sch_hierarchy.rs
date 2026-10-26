@@ -25,6 +25,8 @@ use serde_json::{json, Value};
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+mod migration;
+
 pub fn tools() -> Vec<ToolDef> {
     vec![
         tool!(
@@ -194,12 +196,25 @@ pub fn tools() -> Vec<ToolDef> {
             "Walk the whole sheet tree from a root schematic and reassign sequential page \
              numbers (2, 3, 4, ... — page 1 is always the root and is left untouched) in \
              depth-first order. Fixes gaps left by delete_sheet/duplicate_sheet. Only \
-             touches files whose page numbers actually changed.",
+             touches files whose page numbers actually changed. Optional sheet_order lists \
+             every non-root full UUID instance path in desired page order. Optional \
+             reference_changes atomically remaps exact instance references (including swaps). \
+             dry_run validates and plans without writing; apply returns saved-file readback.",
             json!({
                 "type": "object",
                 "properties": {
                     "schematic": { "type": "string", "description": "Root schematic to start from" },
-                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC }
+                    "project_name": { "type": "string", "description": PROJECT_NAME_DESC },
+                    "sheet_order": { "type": "array", "items": {"type":"string"}, "description": "All non-root full UUID instance paths, in page order starting at 2" },
+                    "reference_changes": { "type": "array", "items": {
+                        "type":"object", "additionalProperties":false,
+                        "properties": {
+                            "sheet_instance_path":{"type":"string"},
+                            "old_reference":{"type":"string"},
+                            "new_reference":{"type":"string"}
+                        }, "required":["sheet_instance_path","old_reference","new_reference"]
+                    } },
+                    "dry_run": {"type":"boolean", "default":false}
                 },
                 "required": ["schematic"]
             }),
@@ -1697,6 +1712,10 @@ async fn handle_renumber_sheet_pages(
     _ctx: &ToolContext,
 ) -> anyhow::Result<CallToolResult> {
     let root_path = get_path(args, "schematic")?;
+    let options = match migration::Options::parse(args) {
+        Ok(options) => options,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
     let project_name = opt_str(args, "project_name")
         .map(str::to_string)
         .unwrap_or_else(|| project_name_for(&root_path));
@@ -1728,20 +1747,50 @@ async fn handle_renumber_sheet_pages(
         &mut visited,
         Some((&root_before, &root_base, &root_uuid)),
         &mut pending,
+        &options,
     )?;
+    if let Err(error) = options.validate_order(&renumbered) {
+        return Ok(CallToolResult::error(error.to_string()));
+    }
+    let references = match migration::remap_references(
+        &mut pending,
+        &project_name,
+        &root_prefix,
+        &renumbered,
+        &options.changes,
+    ) {
+        Ok(references) => references,
+        Err(error) => return Ok(CallToolResult::error(error.to_string())),
+    };
     let mut transitions: Vec<_> = pending
         .into_values()
         .filter(|(_, before, after)| before != after)
         .map(|(path, before, after)| FileTransition::replace(path, before, after))
         .collect();
     transitions.sort_by(|a, b| a.path().cmp(b.path()));
-    if !transitions.is_empty() {
+    let changed_files = transitions.len();
+    if !options.dry_run && !transitions.is_empty() {
         commit_file_transaction(parent_dir(&root_path), transitions)?;
     }
 
+    let (pages, references) = if options.dry_run {
+        (renumbered, references)
+    } else {
+        match migration::readback(&renumbered, &references, &project_name) {
+            Ok(observed) => observed,
+            Err(error) => return Ok(CallToolResult::error(format!(
+                "Migration committed, but saved-file readback failed: {error}. Inspect before retrying."
+            ))),
+        }
+    };
+
     Ok(CallToolResult::json(&json!({
-        "renumbered_count": renumbered.len(),
-        "pages": renumbered
+        "renumbered_count": pages.len(),
+        "pages": pages,
+        "references": references,
+        "changed_files": changed_files,
+        "dry_run": options.dry_run,
+        "source": if options.dry_run { "validated_plan" } else { "saved_file_readback" }
     })))
 }
 
@@ -1755,9 +1804,13 @@ fn collect_renumber_transitions(
     visited: &mut HashSet<PathBuf>,
     source_override: Option<(&str, &str, &str)>,
     pending: &mut HashMap<PathBuf, (PathBuf, String, String)>,
+    options: &migration::Options,
 ) -> anyhow::Result<()> {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if !visited.insert(canon.clone()) {
+        if options.strict {
+            anyhow::bail!("Cannot migrate a cyclic sheet hierarchy");
+        }
         return Ok(()); // cycle guard — already on this DFS path, skip
     }
 
@@ -1786,22 +1839,38 @@ fn collect_renumber_transitions(
         .collect();
 
     for (name, file, sheet_uuid) in &sheet_order {
-        let page = next_page.to_string();
+        let instance_path = format!("{hier_prefix}/{sheet_uuid}");
+        let page = options
+            .pages
+            .get(&instance_path)
+            .cloned()
+            .unwrap_or_else(|| next_page.to_string());
         *next_page += 1;
         if let Some(sheet) = sch.sheets.by_name_mut(name) {
-            let existing_page = sheet
+            let existing_instances: Vec<_> = sheet
                 .instances
                 .iter()
-                .find(|instance| {
+                .filter(|instance| {
                     instance.project_name == project_name && instance.path == hier_prefix
                 })
+                .collect();
+            if options.strict {
+                anyhow::ensure!(
+                    existing_instances.len() == 1,
+                    "Missing or duplicate saved sheet instance for {instance_path}"
+                );
+            }
+            let existing_page = existing_instances
+                .first()
                 .map(|instance| instance.page.as_str());
             if existing_page != Some(page.as_str()) {
                 sheet.set_page(project_name, hier_prefix, &page);
                 changed_ids.push(ItemId::new(sheet.uuid.clone())?);
             }
         }
-        renumbered.push(json!({ "sheet_name": name, "file": file, "page": page }));
+        renumbered.push(json!({ "sheet_name": name, "file": file, "page": page,
+            "sheet_instance_path":instance_path,"sheet_uuid":sheet_uuid,
+            "parent_document":path,"document_path":dir.join(file) }));
 
         let child_path = dir.join(file);
         if child_path.exists() {
@@ -1815,7 +1884,13 @@ fn collect_renumber_transitions(
                 visited,
                 None,
                 pending,
+                options,
             )?;
+        } else if options.strict {
+            anyhow::bail!(
+                "Cannot migrate missing child sheet {}",
+                child_path.display()
+            );
         }
     }
 
@@ -3253,6 +3328,204 @@ mod tests {
         };
         let tree: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(tree["children"][0]["error"], "child file not found on disk");
+    }
+
+    #[tokio::test]
+    async fn explicit_migration_orders_instances_and_swaps_references_atomically() {
+        let (tmp, root, args) = migration_fixture().await;
+        let shared = tmp.path().join("shared.kicad_sch");
+        let before = std::fs::read(&shared).unwrap();
+        let mut dry = args.clone();
+        dry["dry_run"] = json!(true);
+        let planned = handle_renumber_sheet_pages(&dry, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!planned.is_error);
+        assert_eq!(std::fs::read(&shared).unwrap(), before);
+        let result = handle_renumber_sheet_pages(&args, &test_ctx())
+            .await
+            .unwrap();
+        assert!(!result.is_error, "{result:?}");
+        let parent = cse::Schematic::load(&root).unwrap();
+        assert_eq!(parent.sheets.by_name("B").unwrap().page("root"), Some("2"));
+        assert_eq!(parent.sheets.by_name("A").unwrap().page("root"), Some("3"));
+        let child = cse::Schematic::load(&shared).unwrap();
+        let a = args["sheet_order"][1].as_str().unwrap();
+        let b = args["sheet_order"][0].as_str().unwrap();
+        let refs = |path: &str| -> Vec<String> {
+            child
+                .symbols
+                .iter()
+                .flat_map(|s| s.instances())
+                .filter(|i| i.project.as_deref() == Some("root") && i.path.as_deref() == Some(path))
+                .map(|i| i.reference.unwrap())
+                .collect()
+        };
+        assert_eq!(refs(a), vec!["R301", "R202", "U302", "U302"]);
+        assert_eq!(refs(b), vec!["R201", "R302", "U301", "U301"]);
+        assert!(child.symbols.iter().all(|s| s
+            .instances()
+            .iter()
+            .any(|i| i.project.as_deref() == Some("foreign")
+                && i.reference.as_deref() == Some("R999"))));
+        assert_eq!(child.symbols.get(0).unwrap().reference(), Some("R301"));
+        // A stale mapping must refuse, not silently replay onto another component.
+        let snapshot = std::fs::read(&shared).unwrap();
+        let mut stale = args.clone();
+        stale["reference_changes"][0]["old_reference"] = json!("R98765");
+        let refused = handle_renumber_sheet_pages(&stale, &test_ctx()).await;
+        assert!(refused.is_err() || refused.unwrap().is_error);
+        assert_eq!(std::fs::read(&shared).unwrap(), snapshot);
+    }
+
+    async fn migration_fixture() -> (TempDir, PathBuf, Value) {
+        let tmp = TempDir::new().unwrap();
+        let root = blank_schematic(tmp.path(), "root.kicad_sch");
+        for name in ["A", "B"] {
+            let r = handle_add_hierarchical_sheet(
+                &json!({"schematic": root,
+                "sheet_file": "shared.kicad_sch", "sheet_name": name}),
+                &test_ctx(),
+            )
+            .await
+            .unwrap();
+            assert!(!r.is_error);
+        }
+        let parent = cse::Schematic::load(&root).unwrap();
+        let prefix = format!("/{}", parent.uuid.as_ref().unwrap());
+        let a = format!("{prefix}/{}", parent.sheets.by_name("A").unwrap().uuid);
+        let b = format!("{prefix}/{}", parent.sheets.by_name("B").unwrap().uuid);
+        let mut child = cse::Schematic::load(tmp.path().join("shared.kicad_sch")).unwrap();
+        for (ra, rb, unit) in [
+            ("R201", "R301", 1),
+            ("R202", "R302", 1),
+            ("U201", "U301", 1),
+            ("U201", "U301", 2),
+        ] {
+            let mut symbol = cse::Symbol::new(
+                if ra.starts_with('U') {
+                    "Amplifier_Operational:LM358"
+                } else {
+                    "Device:R"
+                },
+                10.0,
+                10.0,
+            );
+            symbol.unit = unit;
+            symbol.set_reference(ra);
+            symbol.set_instance_path("root", &a, ra, unit);
+            symbol.set_instance_path("root", &b, rb, unit);
+            symbol.set_instance_path("foreign", "/foreign", "R999", unit);
+            child.add_symbol(symbol);
+        }
+        child.overwrite().unwrap();
+        let args = json!({"schematic": root, "sheet_order": [b, a], "reference_changes": [
+            {"sheet_instance_path": a,"old_reference":"R201","new_reference":"R301"},
+            {"sheet_instance_path": b,"old_reference":"R301","new_reference":"R201"},
+            {"sheet_instance_path": a,"old_reference":"U201","new_reference":"U302"}
+        ]});
+        (tmp, root, args)
+    }
+
+    #[tokio::test]
+    async fn explicit_migration_refuses_component_merging_and_duplicate_sheet_records() {
+        let (tmp, root, mut args) = migration_fixture().await;
+        let shared = tmp.path().join("shared.kicad_sch");
+        let a = args["sheet_order"][1].as_str().unwrap().to_owned();
+        // Distinct components can expose complementary units of the same library:
+        // they must not be mistaken for the units of one original component.
+        let mut child = cse::Schematic::load(&shared).unwrap();
+        let second = child.symbols.get_mut(3).unwrap();
+        second.set_reference("U202");
+        second.set_instance_path("root", &a, "U202", 2);
+        child.overwrite().unwrap();
+        args["reference_changes"] =
+            json!([{"sheet_instance_path":a,"old_reference":"U201","new_reference":"U202"}]);
+        let before = (
+            std::fs::read(&root).unwrap(),
+            std::fs::read(&shared).unwrap(),
+        );
+        let result = handle_renumber_sheet_pages(&args, &test_ctx()).await;
+        assert!(result.is_err() || result.unwrap().is_error);
+        assert_eq!(
+            (
+                std::fs::read(&root).unwrap(),
+                std::fs::read(&shared).unwrap()
+            ),
+            before
+        );
+
+        let mut parent = cse::Schematic::load(&root).unwrap();
+        let sheet = parent.sheets.by_name_mut("A").unwrap();
+        sheet.instances.push(sheet.instances[0].clone());
+        parent.overwrite().unwrap();
+        args["reference_changes"] = json!([]);
+        args["dry_run"] = json!(true);
+        let before = (
+            std::fs::read(&root).unwrap(),
+            std::fs::read(&shared).unwrap(),
+        );
+        let result = handle_renumber_sheet_pages(&args, &test_ctx()).await;
+        assert!(result.is_err() || result.unwrap().is_error);
+        assert_eq!(
+            (
+                std::fs::read(&root).unwrap(),
+                std::fs::read(&shared).unwrap()
+            ),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_migration_refuses_bad_inputs_without_writes() {
+        let (tmp, root, args) = migration_fixture().await;
+        let shared = tmp.path().join("shared.kicad_sch");
+        let before = (
+            std::fs::read(&root).unwrap(),
+            std::fs::read(&shared).unwrap(),
+        );
+        let mut bad = Vec::new();
+        for value in [
+            json!(null),
+            json!("bad"),
+            json!([]),
+            json!([
+                args["sheet_order"][0].clone(),
+                args["sheet_order"][0].clone()
+            ]),
+        ] {
+            let mut a = args.clone();
+            a["sheet_order"] = value;
+            bad.push(a);
+        }
+        let mut a = args.clone();
+        a["dry_run"] = json!("true");
+        bad.push(a);
+        let mut a = args.clone();
+        a["reference_changes"] = json!(null);
+        bad.push(a);
+        for (field, value) in [
+            ("new_reference", json!("R202")),
+            ("new_reference", json!("R?")),
+            ("old_reference", json!("R404")),
+            ("sheet_instance_path", json!("/not-a-uuid")),
+            ("typo", json!(true)),
+        ] {
+            let mut a = args.clone();
+            a["reference_changes"][0][field] = value;
+            bad.push(a);
+        }
+        for a in bad {
+            let r = handle_renumber_sheet_pages(&a, &test_ctx()).await;
+            assert!(r.is_err() || r.unwrap().is_error, "accepted {a}");
+            assert_eq!(
+                (
+                    std::fs::read(&root).unwrap(),
+                    std::fs::read(&shared).unwrap()
+                ),
+                before
+            );
+        }
     }
 
     #[tokio::test]
