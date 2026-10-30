@@ -16,6 +16,13 @@ use konnect_sexp::writer::{
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+#[path = "library_symbol_properties.rs"]
+mod symbol_properties;
+
+#[cfg(test)]
+#[path = "library_symbol_properties_tests.rs"]
+mod symbol_properties_tests;
+
 // ─── Tool definitions ─────────────────────────────────────────────────────────
 
 /// The pin-item object schema (number/name/type/style/x/y/angle/length) shared
@@ -239,6 +246,8 @@ pub fn tools() -> Vec<ToolDef> {
                     "reference_prefix": { "type": "string", "description": "Default reference prefix (e.g. 'U')" },
                     "value": { "type": "string", "description": "Default value string" },
                     "datasheet": { "type": "string", "description": "Datasheet URL or path (default empty). A '~' is written as an empty string — carrying it fails ERC's library-match check." },
+                    "footprint": { "type": "string", "description": "Default library footprint ID; empty clears it." },
+                    "properties": symbol_properties::schema(),
                     "glyph": {
                         "type": "string",
                         "enum": ["rectangle", "opamp", "buffer", "inverter", "schmitt", "schmitt_inverter", "and", "nand", "or", "nor", "xor", "xnor"],
@@ -282,6 +291,17 @@ pub fn tools() -> Vec<ToolDef> {
                 "required": ["library_path", "name", "reference_prefix"]
             }),
             |args, ctx| async move { handle_create_symbol(args, ctx).await }
+        ),
+        tool!(
+            "edit_symbol_properties",
+            "Atomically upsert fields of an existing reusable library symbol. Preserves omitted presentation attributes, pins, units, artwork and unrelated fields. Refuses inherited symbols and ambiguous targets. Reads the saved file back before reporting success.",
+            json!({"type":"object", "properties":{
+                "library_path":{"type":"string", "description":"Path to .kicad_sym library"},
+                "symbol_name":{"type":"string", "description":"Exact library symbol name"},
+                "footprint":{"type":"string", "description":"Default footprint ID; empty clears it, omission preserves it"},
+                "properties":symbol_properties::schema()
+            },"required":["library_path","symbol_name"]}),
+            |args, ctx| async move { symbol_properties::handle_edit_symbol_properties(args, ctx).await }
         ),
         tool!(
             "delete_symbol",
@@ -4198,6 +4218,14 @@ async fn handle_create_symbol(
         Ok(v) => v,
         Err(e) => return Ok(e),
     };
+    let property_updates = match symbol_properties::parse_updates(args, true) {
+        Ok(updates) => updates,
+        Err(error) => return Ok(error),
+    };
+    let original = match symbol_properties::read_for_create(&lib_path, name) {
+        Ok(content) => content,
+        Err(error) => return Ok(error),
+    };
     let ref_prefix = match require_str(args, "reference_prefix") {
         Ok(v) => v,
         Err(e) => return Ok(e),
@@ -4489,17 +4517,21 @@ async fn handle_create_symbol(
         name,
         numbers,
         names,
-        visible_property("Reference", ref_prefix, ref_y),
-        visible_property("Value", value_str, value_y),
+        visible_property("Reference", &escape_library_string(ref_prefix), ref_y),
+        visible_property("Value", &escape_library_string(value_str), value_y),
         hidden_property("Footprint", ""),
-        hidden_property("Datasheet", datasheet),
+        hidden_property("Datasheet", &escape_library_string(datasheet)),
         hidden_property("Description", ""),
         units_sexp
     );
+    let symbol_sexp = match symbol_properties::patch_symbol(&symbol_sexp, &property_updates) {
+        Ok(symbol) => symbol,
+        Err(error) => return Ok(error),
+    };
 
     // If file doesn't exist, create scaffold
-    let content = if lib_path.exists() {
-        let mut content = tokio::fs::read_to_string(&lib_path).await?;
+    let content = if let Some(source) = &original {
+        let mut content = source.clone();
         content = content.replace("(version 20240108)", "(version 20251024)");
         if !content.contains("(generator_version ") {
             if let Some(position) = content.find("(generator \"") {
@@ -4523,7 +4555,9 @@ async fn handle_create_symbol(
     if let Some(parent) = lib_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
-    write_atomic(&lib_path, &new_content)?;
+    if let Err(error) = symbol_properties::persist(&lib_path, original.as_deref(), &new_content) {
+        return Ok(error);
+    }
 
     let mut result = json!({
         "success": true,
@@ -4533,6 +4567,14 @@ async fn handle_create_symbol(
         "power_pin_count": power_pin_count
     });
     result["units"] = json!(units_report);
+    let observed = match symbol_properties::readback(&lib_path, name, &new_content) {
+        Ok(observed) => observed,
+        Err(error) => return Ok(error),
+    };
+    result["source"] = json!("saved_file");
+    result["changed"] = json!(true);
+    result["properties"] = observed["properties"].clone();
+    result["property_details"] = observed["property_details"].clone();
     if !warnings.is_empty() {
         result["warnings"] = json!(warnings);
     }
@@ -5123,7 +5165,9 @@ async fn handle_get_symbol_info(
             "library": lib_nick,
             "pin_count": pins.len(),
             "pins": pins,
-            "properties": properties
+            "properties": properties,
+            "property_details": symbol_properties::property_details(sym_node),
+            "source": "saved_file"
         }))
         .unwrap(),
     ))
