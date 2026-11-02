@@ -33,6 +33,34 @@ pub(super) fn expand_with(
         return p.exists().then_some(p);
     }
 
+    // KiCad selects a built-in's effective source before resolving its target.
+    // An explicit override must never fall through to a same-name default
+    // library merely because that override's target is absent.
+    // See KiCad 10.0.6 COMMON_SETTINGS::InitializeEnvironment and
+    // PATHS::GetDefault3rdPartyPath. Keep other variables' legacy behavior.
+    let version = match var {
+        "KICAD10_3RD_PARTY" => Some("10.0"),
+        "KICAD9_3RD_PARTY" => Some("9.0"),
+        "KICAD8_3RD_PARTY" => Some("8.0"),
+        _ => None,
+    };
+    if let Some(version) = version {
+        let base = process_var(var)
+            // KiCad InitializeEnvironment ignores empty exported values.
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .or_else(|| configured.get(var).map(PathBuf::from))
+            .or_else(|| {
+                documents_dir.map(|dir| {
+                    dir.join(KICAD_DOCUMENTS_SUBDIR)
+                        .join(version)
+                        .join("3rdparty")
+                })
+            })?;
+        let path = base.join(tail);
+        return path.exists().then_some(path);
+    }
+
     // var_os, not var: `var` treats a non-Unicode value as absent, which would
     // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
     if let Some(base) = process_var(var) {
@@ -53,25 +81,6 @@ pub(super) fn expand_with(
         if p.exists() {
             return Some(p);
         }
-    }
-
-    // KiCad initializes these built-ins even when they are absent from both
-    // the process environment and kicad_common.json. See KiCad 10.0.6
-    // COMMON_SETTINGS::InitializeEnvironment and PATHS::GetDefault3rdPartyPath.
-    // Match the version in the URI, never a different installed version.
-    let version = match var {
-        "KICAD10_3RD_PARTY" => Some("10.0"),
-        "KICAD9_3RD_PARTY" => Some("9.0"),
-        "KICAD8_3RD_PARTY" => Some("8.0"),
-        _ => None,
-    };
-    if let Some(version) = version {
-        let path = documents_dir?
-            .join(KICAD_DOCUMENTS_SUBDIR)
-            .join(version)
-            .join("3rdparty")
-            .join(tail);
-        return path.exists().then_some(path);
     }
 
     // e.g. KICAD10_FOOTPRINT_DIR -> "footprints"
@@ -95,6 +104,54 @@ pub(super) fn expand_with(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn ailab49_empty_export_uses_configured_or_default_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default = tmp
+            .path()
+            .join(KICAD_DOCUMENTS_SUBDIR)
+            .join("10.0/3rdparty/Parts.pretty");
+        let configured = tmp.path().join("configured");
+        std::fs::create_dir_all(&default).unwrap();
+        std::fs::create_dir_all(configured.join("Parts.pretty")).unwrap();
+        let uri = "${KICAD10_3RD_PARTY}/Parts.pretty";
+        assert_eq!(
+            resolve(uri, Some(Path::new("")), None, Some(tmp.path())),
+            Some(default)
+        );
+        assert_eq!(
+            resolve(
+                uri,
+                Some(Path::new("")),
+                Some(&configured),
+                Some(tmp.path())
+            ),
+            Some(configured.join("Parts.pretty"))
+        );
+    }
+
+    #[test]
+    fn ailab49_missing_override_does_not_select_default_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default = tmp
+            .path()
+            .join(KICAD_DOCUMENTS_SUBDIR)
+            .join("10.0/3rdparty/Parts.pretty");
+        std::fs::create_dir_all(&default).unwrap();
+        let missing = tmp.path().join("explicit-but-missing");
+        let uri = "${KICAD10_3RD_PARTY}/Parts.pretty";
+        assert_eq!(
+            resolve(uri, Some(&missing), None, Some(tmp.path())),
+            None,
+            "an exported override must not silently select the default library"
+        );
+        assert_eq!(
+            resolve(uri, None, Some(&missing), Some(tmp.path())),
+            None,
+            "a configured override must not silently select the default library"
+        );
+    }
 
     fn resolve(
         uri: &str,
@@ -158,7 +215,8 @@ mod tests {
             resolve(uri, None, Some(&configured), Some(tmp.path())),
             Some(configured.join("Library.pretty"))
         );
-        // Existing behavior tries the next source when the preceding target is absent.
+        // For third-party roots, a missing explicit target must refuse even when
+        // a lower-priority configured/default library exists.
         assert_eq!(
             resolve(
                 uri,
@@ -166,7 +224,7 @@ mod tests {
                 Some(&configured),
                 Some(tmp.path())
             ),
-            Some(configured.join("Library.pretty"))
+            None
         );
         assert_eq!(
             resolve(uri, None, None, Some(tmp.path())),
