@@ -3262,7 +3262,7 @@ impl KiCadIpcClient {
     /// `definition.items`. Used only for readback evidence — `flip_footprint`
     /// never computes or writes a model transform itself; that is native
     /// KiCad's job via `FlipItems`.
-    fn footprint_3d_models(
+    pub fn footprint_3d_models(
         fp: &kiapi::board::types::FootprintInstance,
     ) -> Result<Vec<crate::types::IpcFootprint3DModel>> {
         let definition = fp

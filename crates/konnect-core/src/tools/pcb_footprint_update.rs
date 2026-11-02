@@ -1,4 +1,4 @@
-use crate::mcp::protocol::{CallToolResult, ToolContent};
+use crate::mcp::protocol::CallToolResult;
 use crate::tool;
 use crate::tools::{
     pcb_board::{attempt_ipc_write, BoardWrite},
@@ -22,8 +22,151 @@ struct LibraryFootprint {
     description_field: Option<String>,
     properties: Vec<kiapi::board::types::Field>,
     pads: Vec<konnect_ipc::IpcPadDefinition>,
+    pad_overrides: Vec<PadOverrides>,
     graphics: Vec<konnect_ipc::IpcGraphicDefinition>,
     models: Vec<kiapi::board::types::Footprint3DModel>,
+}
+
+/// Optional messages retain the distinction between omitted and explicit zero.
+#[derive(Debug, Clone, Default)]
+struct PadOverrides {
+    mask: Option<kiapi::common::types::Distance>,
+    paste: Option<kiapi::common::types::Distance>,
+    paste_ratio: Option<kiapi::common::types::Ratio>,
+    clearance: Option<kiapi::common::types::Distance>,
+    die_length: Option<kiapi::common::types::Distance>,
+    zone: Option<i32>,
+    thermal_width: Option<kiapi::common::types::Distance>,
+    thermal_gap: Option<kiapi::common::types::Distance>,
+    thermal_angle: Option<kiapi::common::types::Angle>,
+}
+
+impl PadOverrides {
+    fn parse(pad: &konnect_sexp::SexpNode) -> Result<Self> {
+        let mut settings = Self::default();
+        let mut seen = BTreeSet::new();
+        for child in pad.children().unwrap_or_default().iter().skip(4) {
+            let Some(tag) = child.head() else { continue };
+            if !matches!(
+                tag,
+                "solder_mask_margin"
+                    | "solder_paste_margin"
+                    | "solder_paste_margin_ratio"
+                    | "clearance"
+                    | "die_length"
+                    | "zone_connect"
+                    | "thermal_bridge_width"
+                    | "thermal_gap"
+                    | "thermal_bridge_angle"
+            ) {
+                continue;
+            }
+            if !seen.insert(tag) {
+                bail!("duplicate pad clause '{tag}'");
+            }
+            if child.children().map_or(0, |children| children.len()) != 2 {
+                bail!("pad clause '{tag}' requires exactly one numeric value");
+            }
+            let value = child
+                .get(1)
+                .and_then(|node| node.as_str()?.parse::<f64>().ok())
+                .filter(|value| value.is_finite())
+                .with_context(|| format!("pad clause '{tag}' requires a finite number"))?;
+            let distance = || -> Result<kiapi::common::types::Distance> {
+                let nm = value * 1_000_000.0;
+                if nm < i64::MIN as f64 || nm >= i64::MAX as f64 {
+                    bail!("pad clause '{tag}' exceeds the typed distance range");
+                }
+                if matches!(
+                    tag,
+                    "clearance" | "die_length" | "thermal_bridge_width" | "thermal_gap"
+                ) && value < 0.0
+                {
+                    bail!("pad clause '{tag}' must be non-negative");
+                }
+                Ok(konnect_ipc::builders::distance(value))
+            };
+            match tag {
+                "solder_mask_margin" => settings.mask = Some(distance()?),
+                "solder_paste_margin" => settings.paste = Some(distance()?),
+                "solder_paste_margin_ratio" => {
+                    if !(-1.0..=1.0).contains(&value) {
+                        bail!("pad clause '{tag}' must be between -1 and 1");
+                    }
+                    settings.paste_ratio = Some(kiapi::common::types::Ratio { value });
+                }
+                "clearance" => settings.clearance = Some(distance()?),
+                "die_length" => settings.die_length = Some(distance()?),
+                "thermal_bridge_width" => settings.thermal_width = Some(distance()?),
+                "thermal_gap" => settings.thermal_gap = Some(distance()?),
+                "thermal_bridge_angle" => {
+                    settings.thermal_angle = Some(kiapi::common::types::Angle {
+                        value_degrees: value,
+                    })
+                }
+                "zone_connect" => {
+                    settings.zone = Some(match value {
+                        0.0 => kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
+                        1.0 => kiapi::board::types::ZoneConnectionStyle::ZcsNone as i32,
+                        2.0 => kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32,
+                        3.0 => kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32,
+                        _ => bail!("pad clause 'zone_connect' must be an integer from 0 to 3"),
+                    })
+                }
+                _ => unreachable!(),
+            }
+        }
+        Ok(settings)
+    }
+
+    fn apply(&self, pad: &mut kiapi::board::types::Pad) -> Result<()> {
+        pad.copper_clearance_override = self.clearance.clone();
+        pad.pad_to_die_length = self.die_length.clone();
+        let stack = pad
+            .pad_stack
+            .as_mut()
+            .context("typed pad has no pad stack")?;
+        if self.mask.is_some() || self.paste.is_some() || self.paste_ratio.is_some() {
+            for outer in [&mut stack.front_outer_layers, &mut stack.back_outer_layers] {
+                let outer = outer.get_or_insert_with(Default::default);
+                if self.mask.is_some() {
+                    outer.solder_mask_settings = Some(kiapi::board::types::SolderMaskOverrides {
+                        solder_mask_margin: self.mask.clone(),
+                    });
+                }
+                if self.paste.is_some() || self.paste_ratio.is_some() {
+                    outer.solder_paste_settings = Some(kiapi::board::types::SolderPasteOverrides {
+                        solder_paste_margin: self.paste.clone(),
+                        solder_paste_margin_ratio: self.paste_ratio.clone(),
+                    });
+                }
+            }
+        }
+        if self.zone.is_some()
+            || self.thermal_width.is_some()
+            || self.thermal_gap.is_some()
+            || self.thermal_angle.is_some()
+        {
+            stack.zone_settings = Some(kiapi::board::types::ZoneConnectionSettings {
+                zone_connection: self
+                    .zone
+                    .unwrap_or(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32),
+                thermal_spokes: if self.thermal_width.is_some()
+                    || self.thermal_gap.is_some()
+                    || self.thermal_angle.is_some()
+                {
+                    Some(kiapi::board::types::ThermalSpokeSettings {
+                        width: self.thermal_width.clone(),
+                        gap: self.thermal_gap.clone(),
+                        angle: self.thermal_angle.clone(),
+                    })
+                } else {
+                    None
+                },
+            });
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -296,8 +439,19 @@ pub(crate) async fn handle_update_footprints_from_library(
             }
 
             let update_count = plan.prepared_items.len();
+            let expected_items = std::mem::take(&mut plan.prepared_items);
             client.run_commit("Update footprints from libraries", |client| {
-                client.update_items_in(document, std::mem::take(&mut plan.prepared_items))
+                // Acquire the native undo scope before the final stale check.
+                let latest_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+                let latest_nets = client.get_nets_in(document.clone())?.into_iter().map(|net| (net.name, net.netcode)).collect();
+                let latest_routed = snapshot_routed_nets(client, document.clone())?;
+                let latest = plan_updates(&planning_board_path, &latest_items, &latest_nets, &latest_routed, &filters);
+                if latest.status == PlanStatus::Conflict || latest.plan_revision != plan.plan_revision {
+                    bail!("stale footprint plan immediately before mutation; no update sent; inspect and replan");
+                }
+                client.update_items_in(document.clone(), expected_items.clone())?;
+                let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+                verify_updated_items(&expected_items, &observed)
             })?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
@@ -315,18 +469,72 @@ pub(crate) async fn handle_update_footprints_from_library(
              file directly. Open the requested board in KiCad and retry.",
             reason.premise()
         )),
-        BoardWrite::Refused(result) => {
-            let message = result
-                .content
-                .into_iter()
-                .find_map(|content| match content {
-                    ToolContent::Text { text } => Some(text),
-                    _ => None,
-                })
-                .unwrap_or_else(|| "KiCad refused the footprint library update".to_string());
-            preflight_conflict(message)
-        }
+        BoardWrite::Refused(result) => result,
     })
+}
+
+fn verify_updated_items(
+    expected: &[prost_types::Any],
+    observed: &[prost_types::Any],
+) -> Result<()> {
+    let observed = observed
+        .iter()
+        .map(|item| kiapi::board::types::FootprintInstance::decode(item.value.as_slice()))
+        .collect::<Result<Vec<_>, _>>()
+        .context("invalid footprint readback")?;
+    for item in expected {
+        let expected = kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?;
+        let id = expected
+            .id
+            .as_ref()
+            .context("updated footprint has no identity")?;
+        let matches = observed
+            .iter()
+            .filter(|fp| fp.id.as_ref() == Some(id))
+            .collect::<Vec<_>>();
+        let [actual] = matches.as_slice() else {
+            bail!(
+                "readback must contain exactly one footprint with identity {}",
+                id.value
+            );
+        };
+        let mut expected_instance = expected.clone();
+        let mut actual_instance = (*actual).clone();
+        expected_instance.definition = None;
+        actual_instance.definition = None;
+        if expected_instance != actual_instance || !changed_domains(&expected, actual)?.is_empty() {
+            bail!(
+                "independent readback differs for footprint {}; native transaction must be dropped",
+                field_text(&expected.reference_field)
+            );
+        }
+        let nets = |fp: &kiapi::board::types::FootprintInstance| -> Result<Vec<(String, Vec<u8>)>> {
+            let mut nets = fp
+                .definition
+                .as_ref()
+                .context("readback has no definition")?
+                .items
+                .iter()
+                .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                .map(|item| {
+                    let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                    Ok((
+                        pad.number,
+                        pad.net.map(|net| net.encode_to_vec()).unwrap_or_default(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nets.sort();
+            Ok(nets)
+        };
+        if nets(&expected)? != nets(actual)? {
+            bail!(
+                "pad-net readback differs for footprint {}",
+                field_text(&expected.reference_field)
+            );
+        }
+    }
+    Ok(())
 }
 
 fn snapshot_routed_nets(
@@ -604,6 +812,8 @@ fn plan_updates(
 
     let mut hasher = Sha256::new();
     hasher.update(serde_json::to_vec(filters).expect("filters serialize"));
+    hasher.update(serde_json::to_vec(net_codes).expect("nets serialize"));
+    hasher.update(serde_json::to_vec(routed_nets).expect("routed nets serialize"));
     let mut changes = Vec::new();
     let mut prepared_items = Vec::new();
     for candidate in selected {
@@ -764,6 +974,11 @@ fn parse_library_footprint(library_id: &str, source: &str) -> Result<LibraryFoot
         datasheet: properties.datasheet,
         description_field: properties.description,
         properties: properties.custom,
+        pad_overrides: root
+            .find_all("pad")
+            .into_iter()
+            .map(PadOverrides::parse)
+            .collect::<Result<Vec<_>>>()?,
         pads,
         graphics,
         models,
@@ -1430,6 +1645,15 @@ fn validate_pad(pad: &konnect_sexp::SexpNode) -> Result<()> {
                 | "uuid"
                 | "tstamp"
                 | "remove_unused_layers"
+                | "solder_mask_margin"
+                | "solder_paste_margin"
+                | "solder_paste_margin_ratio"
+                | "clearance"
+                | "die_length"
+                | "zone_connect"
+                | "thermal_bridge_width"
+                | "thermal_gap"
+                | "thermal_bridge_angle"
         ) {
             bail!("pad clause '{tag}' is not supported by typed library refresh");
         }
@@ -1572,9 +1796,16 @@ fn build_updated_instance(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    let mut pad_index = 0;
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+            library
+                .pad_overrides
+                .get(pad_index)
+                .context("library pad override count differs from typed pads")?
+                .apply(&mut pad)?;
+            pad_index += 1;
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -1930,8 +2161,8 @@ fn changed_domains(
     if current_graphics != updated_graphics {
         changed.insert(ChangedDomain::Graphics);
     }
-    if normalized_items(current_definition, "Footprint3DModel")?
-        != normalized_items(updated_definition, "Footprint3DModel")?
+    if konnect_ipc::KiCadIpcClient::footprint_3d_models(current)?
+        != konnect_ipc::KiCadIpcClient::footprint_3d_models(updated)?
     {
         changed.insert(ChangedDomain::Models);
     }
@@ -1965,6 +2196,7 @@ fn normalized_items(
             if suffix == "Pad" {
                 let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
                 pad.id = None;
+                pad.parent = None;
                 pad.net = None;
                 pad.pad_to_die_length = None;
                 pad.symbol_pin = None;
@@ -1985,6 +2217,14 @@ fn normalized_items(
                     if stack.zone_settings.as_ref().is_some_and(|settings| {
                         settings.zone_connection
                             == kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32
+                            && settings.thermal_spokes.as_ref().is_none_or(|spokes| {
+                                spokes.width.is_none()
+                                    && spokes.gap.is_none()
+                                    && spokes
+                                        .angle
+                                        .as_ref()
+                                        .is_none_or(|angle| angle.value_degrees == 90.0)
+                            })
                     }) {
                         stack.zone_settings = None;
                     }
@@ -2941,15 +3181,199 @@ mod tests {
         );
         let error = parse_library_footprint("Test:Socket", &dashed).unwrap_err();
         assert!(error.to_string().contains("stroke type"), "{error:#}");
+    }
 
-        let solder_margin = LIBRARY_FOOTPRINT.replace(
-            "(roundrect_rratio 0.2))",
-            "(roundrect_rratio 0.2) (solder_mask_margin 0.05))",
-        );
-        let error = parse_library_footprint("Test:Socket", &solder_margin).unwrap_err();
+    #[test]
+    fn seventy_two_instances_include_sixty_six_formerly_rejected_pad_settings() {
+        for index in 0..72 {
+            let source = if index < 66 {
+                LIBRARY_FOOTPRINT.replace(
+                    "(roundrect_rratio 0.2))",
+                    "(roundrect_rratio 0.2) (solder_mask_margin 0.05) (thermal_bridge_angle 45))",
+                )
+            } else {
+                LIBRARY_FOOTPRINT.to_string()
+            };
+            let library = parse_library_footprint("Test:Socket", &source).unwrap();
+            let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+            let prepared =
+                build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                    .unwrap();
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .unwrap();
+            let repeated =
+                build_updated_instance(&updated, &library, &BTreeMap::new(), &BTreeSet::new())
+                    .unwrap();
+            assert!(repeated.changed_domains.is_empty(), "instance {index}");
+        }
+    }
+
+    #[test]
+    fn all_supported_pad_overrides_preserve_exact_values_on_both_sides() {
+        let source = LIBRARY_FOOTPRINT.replace("(roundrect_rratio 0.2))",
+            "(roundrect_rratio 0.2) (solder_mask_margin 0.075) (solder_paste_margin -0.02) (solder_paste_margin_ratio -0.15) (clearance 0.12) (die_length 0.8) (zone_connect 2) (thermal_bridge_width 0.3) (thermal_gap 0.25) (thermal_bridge_angle 37.5))");
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        for side in [
+            kiapi::board::types::BoardLayer::BlFCu,
+            kiapi::board::types::BoardLayer::BlBCu,
+        ] {
+            for rotation in [0.0, 37.0, 90.0, 180.0, 270.0] {
+                let mut current = current_instance(side);
+                current.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: rotation,
+                });
+                let prepared =
+                    build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                        .unwrap();
+                let updated =
+                    kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                        .unwrap();
+                let pad = decoded_pads(&updated).remove(0);
+                assert_eq!(pad.copper_clearance_override.unwrap().value_nm, 120_000);
+                assert_eq!(pad.pad_to_die_length.unwrap().value_nm, 800_000);
+                let stack = pad.pad_stack.unwrap();
+                for outer in [
+                    stack.front_outer_layers.unwrap(),
+                    stack.back_outer_layers.unwrap(),
+                ] {
+                    assert_eq!(
+                        outer
+                            .solder_mask_settings
+                            .unwrap()
+                            .solder_mask_margin
+                            .unwrap()
+                            .value_nm,
+                        75_000
+                    );
+                    let paste = outer.solder_paste_settings.unwrap();
+                    assert_eq!(paste.solder_paste_margin.unwrap().value_nm, -20_000);
+                    assert_eq!(paste.solder_paste_margin_ratio.unwrap().value, -0.15);
+                }
+                let zone = stack.zone_settings.unwrap();
+                assert_eq!(
+                    zone.zone_connection,
+                    kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32
+                );
+                let thermal = zone.thermal_spokes.unwrap();
+                assert_eq!(thermal.width.unwrap().value_nm, 300_000);
+                assert_eq!(thermal.gap.unwrap().value_nm, 250_000);
+                assert_eq!(thermal.angle.unwrap().value_degrees, 37.5);
+                assert!(build_updated_instance(
+                    &updated,
+                    &library,
+                    &BTreeMap::new(),
+                    &BTreeSet::new()
+                )
+                .unwrap()
+                .changed_domains
+                .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_zero_and_omitted_pad_overrides_remain_distinct() {
+        let omitted = konnect_sexp::parse_sexp("(pad 1 smd rect)").unwrap();
+        let explicit = konnect_sexp::parse_sexp("(pad 1 smd rect (solder_mask_margin 0) (solder_paste_margin 0) (solder_paste_margin_ratio 0) (thermal_bridge_angle 0) (thermal_gap 0) (thermal_bridge_width 0) (zone_connect 0) (clearance 0) (die_length 0))").unwrap();
+        let absent = PadOverrides::parse(&omitted).unwrap();
+        let zero = PadOverrides::parse(&explicit).unwrap();
         assert!(
-            error.to_string().contains("solder_mask_margin"),
-            "{error:#}"
+            absent.mask.is_none()
+                && absent.paste.is_none()
+                && absent.paste_ratio.is_none()
+                && absent.thermal_angle.is_none()
+        );
+        assert_eq!(zero.mask.unwrap().value_nm, 0);
+        assert_eq!(zero.paste.unwrap().value_nm, 0);
+        assert_eq!(zero.paste_ratio.unwrap().value, 0.0);
+        assert_eq!(zero.thermal_angle.unwrap().value_degrees, 0.0);
+        assert_eq!(zero.thermal_gap.unwrap().value_nm, 0);
+        assert_eq!(zero.thermal_width.unwrap().value_nm, 0);
+        assert_eq!(zero.clearance.unwrap().value_nm, 0);
+        assert_eq!(zero.die_length.unwrap().value_nm, 0);
+        assert_eq!(
+            zero.zone,
+            Some(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32)
+        );
+    }
+
+    #[test]
+    fn malformed_pad_overrides_refuse_precisely() {
+        for (clause, field) in [
+            ("(solder_mask_margin nan)", "solder_mask_margin"),
+            ("(solder_mask_margin 0 1)", "solder_mask_margin"),
+            ("(solder_mask_margin 1e99)", "solder_mask_margin"),
+            (
+                "(solder_mask_margin 0) (solder_mask_margin 0.1)",
+                "solder_mask_margin",
+            ),
+            ("(thermal_bridge_angle inf)", "thermal_bridge_angle"),
+            ("(thermal_gap -1)", "thermal_gap"),
+            ("(thermal_bridge_width -1)", "thermal_bridge_width"),
+            ("(zone_connect 1.5)", "zone_connect"),
+            ("(zone_connect 4)", "zone_connect"),
+            ("(solder_paste_margin_ratio 2)", "solder_paste_margin_ratio"),
+        ] {
+            let source = LIBRARY_FOOTPRINT.replace(
+                "(roundrect_rratio 0.2))",
+                &format!("(roundrect_rratio 0.2) {clause})"),
+            );
+            let error = parse_library_footprint("Test:Socket", &source).unwrap_err();
+            assert!(error.to_string().contains(field), "{error:#}");
+        }
+    }
+
+    #[test]
+    fn thermal_bridge_angle_is_representable() {
+        let source = LIBRARY_FOOTPRINT.replace(
+            "(roundrect_rratio 0.2))",
+            "(roundrect_rratio 0.2) (thermal_bridge_angle 45))",
+        );
+        parse_library_footprint("Test:Socket", &source).unwrap();
+    }
+
+    #[test]
+    fn pad_local_mask_and_thermal_settings_survive_refresh() {
+        let source = LIBRARY_FOOTPRINT.replace(
+            "(roundrect_rratio 0.2))",
+            "(roundrect_rratio 0.2) (solder_mask_margin 0) (thermal_bridge_angle 37.5))",
+        );
+        let library = parse_library_footprint("Test:Socket", &source).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        let pads = decoded_pads(&updated);
+        let stack = pads[0].pad_stack.as_ref().unwrap();
+        assert_eq!(
+            stack
+                .front_outer_layers
+                .as_ref()
+                .unwrap()
+                .solder_mask_settings
+                .as_ref()
+                .unwrap()
+                .solder_mask_margin
+                .as_ref()
+                .unwrap()
+                .value_nm,
+            0
+        );
+        assert_eq!(
+            stack
+                .zone_settings
+                .as_ref()
+                .unwrap()
+                .thermal_spokes
+                .as_ref()
+                .unwrap()
+                .angle
+                .as_ref()
+                .unwrap()
+                .value_degrees,
+            37.5
         );
     }
 
@@ -3530,6 +3954,8 @@ mod tests {
     #[derive(Default)]
     struct MutationCapture {
         begin_count: usize,
+        footprint_reads: usize,
+        final_items: Vec<prost_types::Any>,
         update_batches: Vec<usize>,
         commit_actions: Vec<kiapi::common::commands::CommitAction>,
     }
@@ -3563,6 +3989,15 @@ mod tests {
         footprint: prost_types::Any,
         fail_update: bool,
     ) -> PlannerMock {
+        spawn_planner_mock_batch(board, vec![footprint], fail_update, false)
+    }
+
+    fn spawn_planner_mock_batch(
+        board: &Path,
+        footprints: Vec<prost_types::Any>,
+        fail_update: bool,
+        corrupt_readback: bool,
+    ) -> PlannerMock {
         use nng::options::Options;
 
         static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -3580,6 +4015,9 @@ mod tests {
         let capture = std::sync::Arc::new(std::sync::Mutex::new(MutationCapture::default()));
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
+            let mut footprints = footprints;
+            let mut before_commit = None;
+            captured.lock().unwrap().final_items = footprints.clone();
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
                 let message = request.message.expect("request message");
@@ -3605,7 +4043,8 @@ mod tests {
                     let items = if command.types
                         == vec![kiapi::common::types::KiCadObjectType::KotPcbFootprint as i32]
                     {
-                        vec![footprint.clone()]
+                        captured.lock().unwrap().footprint_reads += 1;
+                        footprints.clone()
                     } else {
                         Vec::new()
                     };
@@ -3626,6 +4065,7 @@ mod tests {
                     ))
                 } else if message.type_url.ends_with("BeginCommit") {
                     captured.lock().unwrap().begin_count += 1;
+                    before_commit = Some(footprints.clone());
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::BeginCommitResponse {
                             id: Some(kiapi::common::types::Kiid {
@@ -3643,6 +4083,26 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
+                    if !fail_update && !corrupt_readback {
+                        for updated in &update.items {
+                            let fp = kiapi::board::types::FootprintInstance::decode(
+                                updated.value.as_slice(),
+                            )
+                            .unwrap();
+                            let old = footprints
+                                .iter_mut()
+                                .find(|old| {
+                                    kiapi::board::types::FootprintInstance::decode(
+                                        old.value.as_slice(),
+                                    )
+                                    .unwrap()
+                                    .id == fp.id
+                                })
+                                .unwrap();
+                            *old = updated.clone();
+                        }
+                    }
+                    captured.lock().unwrap().final_items = footprints.clone();
                     let updated_items = update
                         .items
                         .into_iter()
@@ -3674,6 +4134,10 @@ mod tests {
                     let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
                         .unwrap();
                     captured.lock().unwrap().commit_actions.push(end.action());
+                    if end.action() == kiapi::common::commands::CommitAction::CmaDrop {
+                        footprints = before_commit.take().unwrap();
+                        captured.lock().unwrap().final_items = footprints.clone();
+                    }
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
                         "kiapi.common.commands.EndCommitResponse",
@@ -3764,6 +4228,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readback_mismatch_drops_the_commit_and_restores_exact_input() {
+        let (_temp, board, items) = plan_fixture();
+        let before = vec![items[2].clone()];
+        let mock = spawn_planner_mock_batch(&board, before.clone(), false, true);
+        let context = test_context(&mock.url);
+        let dry = handle_update_footprints_from_library(&json!({"board": board}), &context)
+            .await
+            .unwrap();
+        let revision = result_json(&dry)["plan_revision"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let result = handle_update_footprints_from_library(
+            &json!({"board": board, "dry_run": false, "expected_plan_revision": revision}),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_error);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaDrop]
+        );
+        assert_eq!(capture.final_items, before);
+    }
+
+    #[tokio::test]
+    async fn served_refresh_applies_description_and_models_with_independent_readback() {
+        use crate::mcp::handler::McpHandler;
+        use crate::tools::ServerConfig;
+        let (_temp, board, items) = plan_fixture();
+        let mock = spawn_planner_mock(&board, items[2].clone(), false);
+        let handler = McpHandler::new(ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: mock.url.clone(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap();
+        async fn call(handler: &McpHandler, args: serde_json::Value) -> serde_json::Value {
+            let response = handler.handle_message(json!({"jsonrpc":"2.0", "id":48, "method":"tools/call", "params":{"name":"update_footprints_from_library", "arguments":args}})).await.unwrap();
+            let result = response.result.unwrap();
+            assert_ne!(result["isError"], true, "{result}");
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
+        }
+        let dry = call(&handler, json!({"board":board})).await;
+        assert_eq!(dry["status"], "ready");
+        let applied = call(
+            &handler,
+            json!({"board":board, "dry_run":false, "expected_plan_revision":dry["plan_revision"]}),
+        )
+        .await;
+        assert_eq!(applied["status"], "applied");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(
+            capture.footprint_reads, 4,
+            "dry run, apply plan, in-commit stale check, independent readback"
+        );
+        assert_eq!(capture.update_batches, vec![1]);
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+        let after =
+            kiapi::board::types::FootprintInstance::decode(capture.final_items[0].value.as_slice())
+                .unwrap();
+        assert_eq!(
+            after
+                .definition
+                .as_ref()
+                .unwrap()
+                .attributes
+                .as_ref()
+                .unwrap()
+                .description,
+            "updated description"
+        );
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let expected_models = library
+            .models
+            .iter()
+            .map(|model| builders::pack_any(model, "kiapi.board.types.Footprint3DModel"))
+            .collect::<Vec<_>>();
+        let actual_models = after
+            .definition
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .filter(|item| item.type_url.ends_with("Footprint3DModel"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(actual_models, expected_models);
+    }
+
+    #[tokio::test]
     async fn failed_update_drops_the_single_commit() {
         let (_temp, board, items) = plan_fixture();
         let mock = spawn_planner_mock(&board, items[2].clone(), true);
@@ -3788,7 +4353,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(result_json(&failed)["status"], "conflict");
+        assert!(failed.is_error);
         let capture = mock.capture.lock().unwrap();
         assert_eq!(capture.begin_count, 1);
         assert_eq!(capture.update_batches, vec![1]);
