@@ -1603,62 +1603,26 @@ fn kicad_user_path_vars() -> std::collections::HashMap<String, String> {
         .unwrap_or_default()
 }
 
+#[path = "library_uri_resolver.rs"]
+mod uri_resolver;
+
 fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
-    let Some(rest) = uri.strip_prefix("${") else {
-        return (!uri.is_empty()).then(|| PathBuf::from(uri));
-    };
-    let close = rest.find('}')?;
-    let var = &rest[..close];
-    let tail = rest[close + 1..].trim_start_matches(['/', '\\']);
-
-    // ${KIPRJMOD} is the project directory — resolved from the table's own
-    // location, not the environment: KiCad sets it per open project at
-    // runtime, so an exported value (if any) may belong to a different
-    // project than the table being read. Project-scoped registrations are
-    // the default for register_footprint_library, so this is the common
-    // case for user-registered libraries, not an edge.
-    if var == "KIPRJMOD" {
-        let p = kiprjmod?.join(tail);
-        return p.exists().then_some(p);
-    }
-
-    // var_os, not var: `var` treats a non-Unicode value as absent, which would
-    // send a perfectly good ${KICAD*_DIR} down the install-root guess path.
-    if let Some(base) = std::env::var_os(var) {
-        let p = PathBuf::from(base).join(tail);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // User path variables (Preferences → Configure Paths) are stored in
-    // kicad_common.json and are NOT process environment variables, so the
-    // var_os lookup above can never see them. They are the normal way to write
-    // a portable lib-table — `${MY_PARTS}/house.kicad_sym` — and without this
-    // every such entry resolved to None and the library was invisible.
-    // Credit to @JYPochez (#172) for finding this.
-    if let Some(base) = kicad_user_path_vars().get(var) {
-        let p = PathBuf::from(base).join(tail);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-
-    // e.g. KICAD10_FOOTPRINT_DIR -> "footprints"
-    let kind = if var.ends_with("_FOOTPRINT_DIR") {
-        "footprints"
-    } else if var.ends_with("_SYMBOL_DIR") {
-        "symbols"
-    } else if var.ends_with("_3DMODEL_DIR") {
-        "3dmodels"
-    } else {
-        return None;
-    };
-
-    super::find_kicad_library_dirs(kind)
-        .into_iter()
-        .map(|base| base.join(tail))
-        .find(|p| p.exists())
+    // KiCad uses the user data directory on Unix, Documents on Windows/macOS.
+    #[cfg(any(target_os = "windows", target_os = "macos"))]
+    let platform_documents_dir = dirs::document_dir;
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    let platform_documents_dir = dirs::data_local_dir;
+    let documents_dir = std::env::var_os("KICAD_DOCUMENTS_HOME")
+        .map(PathBuf::from)
+        .or_else(platform_documents_dir);
+    uri_resolver::expand_with(
+        uri,
+        kiprjmod,
+        |key| std::env::var_os(key),
+        &kicad_user_path_vars(),
+        documents_dir.as_deref(),
+        super::find_kicad_library_dirs,
+    )
 }
 
 /// Maximum depth when following nested `(type "Table")` lib-table references.
