@@ -22,15 +22,18 @@ def run(binary, native_python, root_source):
                    KICAD_CONFIG_HOME=str(root / "native-config"),
                    KICAD_DOCUMENTS_HOME=str(documents), KONNECT_STATE_DIR=str(root / "state"))
         env.pop("KICAD10_3RD_PARTY", None)
-        if root_source == "exported":
-            env["KICAD10_3RD_PARTY"] = str(third_party)
-        elif root_source == "configured":
+        if root_source.startswith("empty-"):
+            env["KICAD10_3RD_PARTY"] = ""
+        override = root / "missing override" if root_source.startswith("missing-") else third_party
+        if root_source.endswith("exported"):
+            env["KICAD10_3RD_PARTY"] = str(override)
+        elif root_source.endswith("configured"):
             config_base = root / "config" if sys.platform == "win32" else (
                 root / "Library/Preferences" if sys.platform == "darwin" else root / ".config")
             config_dir = config_base / "kicad/10.0"
             config_dir.mkdir(parents=True)
             (config_dir / "kicad_common.json").write_text(json.dumps({"environment": {
-                "vars": {"KICAD10_3RD_PARTY": str(third_party)}}}))
+                "vars": {"KICAD10_3RD_PARTY": str(override)}}}))
         config = root / "konnect.toml"
         config.write_text('ipc_address = "inproc://ailab49-library-only"\n')
         process = subprocess.Popen([str(Path(binary).resolve()), "--config", str(config)],
@@ -63,15 +66,22 @@ def run(binary, native_python, root_source):
         try:
             request("initialize", dict(protocolVersion="2025-06-18", capabilities={},
                                        clientInfo=dict(name="ailab49", version="1")))
+            process.stdin.write(json.dumps(dict(jsonrpc="2.0", method="notifications/initialized")) + "\n")
+            process.stdin.flush()
             call("load_toolset", dict(name="library"))
             call("create_footprint", dict(output=str(pretty / "Probe.kicad_mod"), name="Probe",
                  pads=[dict(number="1", type="smd", shape="rect", x=0, y=0, width=1, height=1)]))
             call("register_footprint_library", dict(
                 library_path="${KICAD10_3RD_PARTY}/footprints/Vendor Parts.pretty",
                 nickname="AILAB49", scope="global"))
-            found = call("get_footprint_info", dict(footprint_path="AILAB49:Probe"))
-            assert found["pad_count"] == 1 and Path(found["path"]) == pretty / "Probe.kicad_mod", found
-            print(f"PASS served {root_source} third-party lookup with spaces; pad_count=1")
+            if root_source.startswith("missing-"):
+                refused = call("get_footprint_info", dict(footprint_path="AILAB49:Probe"), False)
+                assert "unresolvable URI" in refused and "KICAD10_3RD_PARTY" in refused, refused
+                print(f"PASS served {root_source} refuses existing default same-name library")
+            else:
+                found = call("get_footprint_info", dict(footprint_path="AILAB49:Probe"))
+                assert found["pad_count"] == 1 and Path(found["path"]) == pretty / "Probe.kicad_mod", found
+                print(f"PASS served {root_source} third-party lookup with spaces; pad_count=1")
             call("register_footprint_library", dict(library_path="${AILAB49_UNKNOWN}/Missing.pretty",
                                                     nickname="AILAB49Missing", scope="global"))
             refused = call("get_footprint_info", dict(footprint_path="AILAB49Missing:Probe"), False)
@@ -105,6 +115,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("binary")
     parser.add_argument("--native-python")
-    parser.add_argument("--root-source", choices=["default", "configured", "exported"], default="default")
+    parser.add_argument("--root-source", choices=["default", "configured", "exported",
+                        "missing-configured", "missing-exported", "empty-default",
+                        "empty-configured"], default="default")
     args = parser.parse_args()
     run(args.binary, args.native_python, args.root_source)

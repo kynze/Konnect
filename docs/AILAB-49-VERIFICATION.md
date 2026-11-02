@@ -1,12 +1,12 @@
 # AILAB-49 verification
 
-Status: WIP checkpoint at coordinator-requested clean interruption. Acceptance incomplete; no release claim.
+Status: resolver acceptance complete for local Quality Check; no release or integration performed. Final reviewer recheck remains the coordinator's gate.
 
 ## Scope and behavior
 
-Base: d38a6ed6a118bc51f775517a4a1e9b64a9ed9964; origin kynze/Konnect, upstream mixelpixx/Konnect verified. Only library URI resolution, dedicated resolver tests, a uniquely named served harness and task docs are owned. Installed 0.13.0 / 6bbe3e4 was not replaced or used as changed-build proof.
+Expected base d38a6ed6a118bc51f775517a4a1e9b64a9ed9964 and origin/upstream remotes verified in the initial dispatch; resumed at owned WIP e07ae83a868c516773db2556535cf124def478ad. Installed 0.13.0 / 6bbe3e4 was neither replaced nor used as modified-build evidence.
 
-The existing process environment and read-only kicad_common.json environment.vars lookups remain first. The new fallback resolves KICAD10_3RD_PARTY (also supported 9/8 versions) to the corresponding version under KICAD_DOCUMENTS_HOME, or the platform directory used by KiCad: Documents/KiCad on Windows/macOS, user-data/kicad on Unix. The selected target must exist; unknown variables and targets absent from every searched source remain unresolved. **Known P1: the new default fallback can select a same-name library after an explicit exported/configured override target is missing; this differs from KiCad override semantics and blocks release.** KIPRJMOD remains bound to the table/project context rather than exported environment. No caller signature changes.
+The unchanged expand_lib_uri signature delegates to a dedicated module declared inside library.rs. Standard third-party roots select a nonempty exported override first, then a configured kicad_common.json variable, then the KiCad default root; existence is checked only after source selection. A missing explicit override refuses instead of silently choosing another same-name library. An empty exported value is ignored as KiCad does. Other variable kinds retain their previous behavior. KIPRJMOD stays bound to table/project context. No personal paths are hard-coded and settings reads remain read-only.
 
 ## Independent KiCad evidence
 
@@ -21,30 +21,31 @@ Upstream source pinned to tag 10.0.6:
 
 No installed user configuration was needed or read for evidence. No personal paths are hard-coded in the implementation.
 
-## Regression and shared refresh boundary
+## Observed red/green
 
-Before adding the fallback, a standalone Rust harness compiled the extracted resolver with no process/config variables, an explicitly injected temporary document root, and an existing `KiCad/10.0/3rdparty/footprints/Vendor Parts.pretty` directory. Its assertion failed with `left: None`, `right: Some(...Vendor Parts.pretty)`; the exact same harness passed after adding the fallback. This isolates the missing default boundary rather than adding an environment-key alias.
+1. Original missing default: before adding the fallback, a standalone Rust harness with an injected documents root and an existing third-party library with spaces returned None instead of the path. The identical harness passed after adding the fallback.
+2. Reviewed P1: `cargo test -p konnect-core --lib ailab49_missing_override -- --nocapture` failed before correction: left was the existing default Parts.pretty, right was None. After selecting the effective source before target validation, the regression passed for both exported and configured overrides.
+3. Empty export: a standalone Rust harness failed with None instead of the default path before filtering empty exported values; the identical harness then exited 0. Persistent tests cover both configured and default fallback for an empty export.
 
-`pcb_footprint_update.rs::plan_updates` lines 636-647 calls the unchanged `library::resolve_footprint_path` and maps its Err to `footprint_library_resolution_failed`. That resolver reads and flattens the project/global table through expand_lib_uri, shared with served get_footprint_info. The resolver and served lookup boundary are tested here; the refresh diagnostic envelope and native replacement behavior remain owned by the refresh worker, with no fabricated envelope claim.
+## Final commands and counts
 
-## Reproduction setup
+- `cargo test -p konnect-core --lib uri_resolver -- --nocapture`: 7 passed before the empty-export case was added.
+- `cargo test -p konnect-core --lib tools::library:: -- --test-threads=1`: **178 passed, 1 failed, 0 ignored**. All **8 resolver tests passed**, covering precedence, missing targets and overrides, unknown variables, version isolation, empty export, spaces, Windows separators, KIPRJMOD and stock footprint-directory compatibility.
+- The one broader failure was existing `symbol_source_tests::a_sheet_in_a_subdirectory_resolves_against_the_project_table`, before URI resolution: ProjectConflict named the fixture root plus chk.kicad_sch and chk2.kicad_sch under the normal user TEMP ancestry. A targeted rerun with another child of normal TEMP still failed; the exact unchanged compiled test with TEMP/TMP set to a unique directory under C:/tmp **passed (1 passed, 0 failed)**. No unrelated file was changed or removed. The full group was not rerun after this environment isolation because the coordinator requested final handoff.
+- `cargo build -p konnect --bin konnect`: final incremental build succeeded after the empty-export change (29.90s). Task binary: C:/tmp/konnect-ailab49-target/debug/konnect.exe.
+- `python tests/ailab49_library_resolution.py <task-built-binary> --root-source <mode>` passed for **7 modes**: default, configured, exported, missing-configured, missing-exported, empty-default, empty-configured. Each mode checked its expected lookup/refusal plus unknown-variable and missing-directory refusals: **21 served assertions passed**. The default run included `--native-python C:/Program Files/KiCad/10.0/bin/python.exe`: native 10.0.6 loaded the same builder-generated footprint and independently reported one pad (**1 native payload assertion passed**).
+- `python -m py_compile tests/ailab49_library_resolution.py`, owned-file rustfmt check and `git diff --check`: passed.
 
-Use the existing toolchain with PROTOC set and task-isolated CARGO_TARGET_DIR and KONNECT_STATE_DIR. This Windows run uses `C:/tmp/konnect-ailab49-target` because the longer worktree-local CMake/MSBuild scratch paths exceeded Windows limits; CARGO_BUILD_JOBS=2. No shared target/state or installed binaries are changed.
+The served harness creates the footprint and library tables through the built server's existing tools; it never patches design/library-table text. It uses disposable child-process config, state and documents roots and an explicit private inproc endpoint; no IPC tool is invoked. Pure resolver tests inject sources and do not mutate process environment; harness environment changes exist only in child processes.
 
-Observed commands and outcomes:
+## Shared refresh boundary and limits
 
-- Pre-fix standalone rustc harness: assertion failed, None instead of the existing injected third-party library path; after fallback the identical harness exited 0.
-- `cargo test -p konnect-core --lib uri_resolver -- --nocapture`: **6 passed, 0 failed, 0 ignored**, 1724 filtered out. Tests cover default root with spaces, exported/configured/default precedence, missing/unresolved variables, version isolation, KIPRJMOD and stock footprint directory behavior, and Windows separators. Pure context injection means no process environment changes need restoration.
-- `python -m py_compile tests/ailab49_library_resolution.py`: passed syntax compilation. The served harness itself is **not executed**.
-- Owned-file rustfmt was applied after its first check reported formatting differences; final owned-file format check and git diff --check are checkpoint checks.
-- `cargo build -p konnect --bin konnect`: started, then intentionally stopped on the coordinator's clean-interruption request; **no completed task-built server** and no served-lookup claim.
+`pcb_footprint_update.rs::plan_updates` lines 636-647 calls unchanged `library::resolve_footprint_path` and maps Err to `footprint_library_resolution_failed`. That resolver flattens the same tables through expand_lib_uri as served get_footprint_info. This task verifies the common resolver and served lookup/refusal, not the refresh diagnostic envelope or native PCB replacement.
 
-Initial build setup failures (not regression evidence): missing cmake on PATH, pip CMake wrapper import, long CMake/MSBuild scratch path; resolved using existing native CMake and short task-owned target. A function-item lifetime compilation error in the extracted wrapper was corrected with a closure before the six passing tests.
+Native FootprintLoad on an expanded path proves payload compatibility, not native variable expansion. Default path semantics are independently grounded in pinned KiCad 10.0.6 source above. Windows execution is observed; Linux/macOS logic is source-grounded but not executed there. No live editor/default API endpoint, native IPC, user design/configuration changes, installed server replacement, push, tag, merge, deployment or release occurred. No ignored tests or full workspace-suite claim.
 
-Independent review P1 received at interruption: KiCad chooses an explicit process/configured override independent of target existence. The current WIP instead falls through to the new default root when that override target is absent, potentially loading a different same-name footprint. Existing configured-vs-exported missing-target fallback predates this task, but the new third-party default introduces an additional unsafe source; fix the new fallback to apply only when no effective override exists and add a regression where the explicit override target is absent while the default target exists. The passing precedence test currently preserves legacy fall-through and does not establish this guard. Do not release this checkpoint.
+## Handoff
 
-Remaining acceptance/release blockers: address the P1 override guard and regression; finish the task-built server; execute the served harness for default/configured/exported roots and negative cases; perform native footprint loading comparison (loading an already-expanded path establishes payload compatibility, not native variable expansion); run one broader library regression group. Native Python import/version and source inspection are observed, but native URI expansion/live refresh/placement and the refreshed diagnostic envelope are not verified. No full workspace suite or cross-platform execution was performed.
+Reviewed P1 and empty-export defects are corrected and tested. Remaining validation limit: full broader group has its original environment-dependent 178/1 result, with the failing test passing in isolated C:/tmp; coordinator may rerun the group there if required. Next owner is coordinator/reviewer for final SHA review, integration and release gates. This worker stops at Quality Check and starts no follow-on task.
 
-## Limits and next owner
-
-Windows execution is observed. Linux/macOS path logic is source-grounded but not executed on those platforms. No live editor, default API endpoint, native IPC, installed server replacement, or user design/configuration mutation is part of this verification. Coordinator owns integration and Quality Check; no merge, push, tag, release or deployment is authorized here.
+Build setup used existing Rust/protoc/CMake with CARGO_BUILD_JOBS=2, task-owned CARGO_TARGET_DIR=C:/tmp/konnect-ailab49-target and worktree-local KONNECT_STATE_DIR; no shared target/state or installed configuration was changed. Earlier interrupted build/setup failures are not counted as regression evidence.
