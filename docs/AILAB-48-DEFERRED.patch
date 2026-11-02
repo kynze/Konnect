@@ -1,0 +1,717 @@
+--- a/crates/konnect-core/src/tools/pcb_footprint_update.rs
++++ b/crates/konnect-core/src/tools/pcb_footprint_update.rs
+@@ -179,6 +179,7 @@
+ #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+ #[serde(rename_all = "snake_case")]
+ enum ChangedDomain {
++    LibraryId,
+     Pads,
+     Graphics,
+     Attributes,
+@@ -191,12 +192,24 @@
+     item: prost_types::Any,
+     changed_domains: BTreeSet<ChangedDomain>,
+     preserved: PreservedState,
++    moved_routed_pads: Vec<String>,
+ }
+ 
+ #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+ struct UpdateFilters {
+     references: Option<BTreeSet<String>>,
+     library_ids: Option<BTreeSet<String>>,
++    scope: UpdateScope,
++    replacements: BTreeMap<String, String>,
++    allow_routed_pad_movement: bool,
++}
++
++#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
++#[serde(rename_all = "snake_case")]
++enum UpdateScope {
++    #[default]
++    Full,
++    Models,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq)]
+@@ -289,6 +302,7 @@
+     library_id: String,
+     changed_domains: BTreeSet<ChangedDomain>,
+     preserved: PreservedState,
++    moved_routed_pads: Vec<String>,
+ }
+ 
+ #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+@@ -306,6 +320,7 @@
+     changes: Vec<PlannedUpdate>,
+     diagnostics: Vec<UpdateDiagnostic>,
+     prepared_items: Vec<prost_types::Any>,
++    model_inspections: Vec<serde_json::Value>,
+ }
+ 
+ pub(crate) fn tool() -> ToolDef {
+@@ -332,6 +347,15 @@
+                     "items": { "type": "string" },
+                     "description": "Optional exact Library:Footprint allowlist"
+                 },
++                "scope": { "type": "string", "enum": ["full", "models"], "default": "full", "description": "Models refreshes only complete library model lists in one batch; dry run inspects before/after lists." },
++                "replacements": {
++                    "type": "array", "items": {
++                        "type": "object", "properties": { "reference": { "type": "string", "minLength": 1 }, "library_id": { "type": "string", "minLength": 3 } },
++                        "required": ["reference", "library_id"], "additionalProperties": false
++                    },
++                    "description": "Explicit footprint ID replacements. With omitted references, select only these references. Connected logical pad numbers must map uniquely."
++                },
++                "allow_routed_pad_movement": { "type": "boolean", "default": false, "description": "Explicitly allow changed pad centres on routed nets; copper is unchanged and connectivity requires DRC/reconnection." },
+                 "dry_run": {
+                     "type": "boolean",
+                     "default": true,
+@@ -357,7 +381,20 @@
+     use kiapi::common::types::KiCadObjectType as ObjectType;
+ 
+     let board_path = crate::tools::get_path(args, "board")?;
+-    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
++    let dry_run = match args.get("dry_run") {
++        None => true,
++        Some(serde_json::Value::Bool(value)) => *value,
++        _ => return Ok(crate::tools::invalid_arg("dry_run", "must be boolean")),
++    };
++    if args
++        .get("expected_plan_revision")
++        .is_some_and(|value| !value.is_string())
++    {
++        return Ok(crate::tools::invalid_arg(
++            "expected_plan_revision",
++            "must be a string",
++        ));
++    }
+     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
+     if !dry_run && expected_revision.is_none() {
+         return Ok(CallToolResult::error_kind(
+@@ -469,6 +506,7 @@
+              file directly. Open the requested board in KiCad and retry.",
+             reason.premise()
+         )),
++        // Keep typed recovery/uncertainty evidence from the IPC boundary.
+         BoardWrite::Refused(result) => result,
+     })
+ }
+@@ -602,6 +640,8 @@
+             "conflicts": plan.coverage.conflicts
+         },
+         "changes": plan.changes,
++        "model_inspections": plan.model_inspections,
++        "routing": { "copper_geometry": "untouched", "connectivity": "not_verified_requires_drc" },
+         "diagnostics": plan.diagnostics,
+         "undo": if applied {
+             Some("Ctrl-Z reverses the whole footprint library update.")
+@@ -683,9 +723,85 @@
+         Ok(parsed)
+     }
+ 
++    let scope = match args.get("scope") {
++        None => UpdateScope::Full,
++        Some(serde_json::Value::String(value)) if value == "full" => UpdateScope::Full,
++        Some(serde_json::Value::String(value)) if value == "models" => UpdateScope::Models,
++        _ => {
++            return Err(ArgumentError {
++                field: "scope".into(),
++                reason: "must be full or models".into(),
++            })
++        }
++    };
++    let allow_routed_pad_movement = match args.get("allow_routed_pad_movement") {
++        None => false,
++        Some(serde_json::Value::Bool(value)) => *value,
++        _ => {
++            return Err(ArgumentError {
++                field: "allow_routed_pad_movement".into(),
++                reason: "must be boolean".into(),
++            })
++        }
++    };
++    let mut replacements = BTreeMap::new();
++    if let Some(value) = args.get("replacements") {
++        let entries = value.as_array().ok_or_else(|| ArgumentError {
++            field: "replacements".into(),
++            reason: "must be an array".into(),
++        })?;
++        for entry in entries {
++            let reference = entry
++                .get("reference")
++                .and_then(serde_json::Value::as_str)
++                .filter(|v| !v.trim().is_empty());
++            let library_id = entry
++                .get("library_id")
++                .and_then(serde_json::Value::as_str)
++                .filter(|v| super::library::is_lib_id(v));
++            let (Some(reference), Some(library_id)) = (reference, library_id) else {
++                return Err(ArgumentError {
++                    field: "replacements".into(),
++                    reason:
++                        "each entry requires an exact reference and Library:Footprint library_id"
++                            .into(),
++                });
++            };
++            if replacements
++                .insert(reference.to_string(), library_id.to_string())
++                .is_some()
++            {
++                return Err(ArgumentError {
++                    field: "replacements".into(),
++                    reason: format!("duplicate reference '{reference}'"),
++                });
++            }
++        }
++    }
++    if scope == UpdateScope::Models && !replacements.is_empty() {
++        return Err(ArgumentError {
++            field: "replacements".into(),
++            reason: "footprint ID replacement requires scope full".into(),
++        });
++    }
++    let references = parse(args, "references")?
++        .or_else(|| (!replacements.is_empty()).then(|| replacements.keys().cloned().collect()));
++    if replacements.keys().any(|reference| {
++        references
++            .as_ref()
++            .is_some_and(|refs| !refs.contains(reference))
++    }) {
++        return Err(ArgumentError {
++            field: "replacements".into(),
++            reason: "every replacement reference must be selected by references".into(),
++        });
++    }
+     Ok(UpdateFilters {
+-        references: parse(args, "references")?,
++        references,
+         library_ids: parse(args, "library_ids")?,
++        scope,
++        replacements,
++        allow_routed_pad_movement,
+     })
+ }
+ 
+@@ -816,7 +932,26 @@
+     hasher.update(serde_json::to_vec(routed_nets).expect("routed nets serialize"));
+     let mut changes = Vec::new();
+     let mut prepared_items = Vec::new();
+-    for candidate in selected {
++    let mut model_inspections = Vec::new();
++    let mut library_sources = BTreeMap::<String, String>::new();
++    for (reference, _) in &filters.replacements {
++        if !selected
++            .iter()
++            .any(|candidate| &candidate.reference == reference)
++        {
++            diagnostics.push(UpdateDiagnostic {
++                code: "replacement_not_selected".into(),
++                message: format!(
++                    "replacement reference '{reference}' is absent or excluded by filters"
++                ),
++                reference: Some(reference.clone()),
++            });
++        }
++    }
++    for mut candidate in selected {
++        if let Some(library_id) = filters.replacements.get(&candidate.reference) {
++            candidate.library_id = library_id.clone();
++        }
+         if candidate.library_id.is_empty() {
+             continue;
+         }
+@@ -843,54 +978,78 @@
+             continue;
+         }
+ 
+-        let library_path = match super::library::resolve_footprint_path(
+-            &candidate.library_id,
+-            board_path.parent(),
+-        ) {
+-            Ok(path) => path,
+-            Err(message) => {
+-                diagnostics.push(UpdateDiagnostic {
+-                    code: "footprint_library_resolution_failed".to_string(),
+-                    message,
+-                    reference: Some(candidate.reference),
+-                });
+-                continue;
++        let source = if let Some(source) = library_sources.get(&candidate.library_id) {
++            source.clone()
++        } else {
++            let path = match super::library::resolve_footprint_path(
++                &candidate.library_id,
++                board_path.parent(),
++            ) {
++                Ok(path) => path,
++                Err(message) => {
++                    diagnostics.push(UpdateDiagnostic {
++                        code: "footprint_library_resolution_failed".into(),
++                        message,
++                        reference: Some(candidate.reference),
++                    });
++                    continue;
++                }
++            };
++            match std::fs::read_to_string(&path) {
++                Ok(source) => {
++                    library_sources.insert(candidate.library_id.clone(), source.clone());
++                    source
++                }
++                Err(error) => {
++                    diagnostics.push(UpdateDiagnostic {
++                        code: "footprint_library_read_failed".into(),
++                        message: format!("failed to read {}: {error}", path.display()),
++                        reference: Some(candidate.reference),
++                    });
++                    continue;
++                }
+             }
+         };
+-        let source = match std::fs::read_to_string(&library_path) {
+-            Ok(source) => source,
++        let prepared = match if filters.scope == UpdateScope::Models {
++            build_model_update(&candidate.instance, &source)
++        } else {
++            match parse_library_footprint(&candidate.library_id, &source) {
++                Ok(library) => {
++                    build_updated_instance(&candidate.instance, &library, net_codes, routed_nets)
++                }
++                Err(error) => {
++                    diagnostics.push(UpdateDiagnostic {
++                        code: "unsupported_library_footprint".into(),
++                        message: format!("{error:#}"),
++                        reference: Some(candidate.reference),
++                    });
++                    continue;
++                }
++            }
++        } {
++            Ok(prepared) => prepared,
+             Err(error) => {
+                 diagnostics.push(UpdateDiagnostic {
+-                    code: "footprint_library_read_failed".to_string(),
+-                    message: format!("failed to read {}: {error}", library_path.display()),
+-                    reference: Some(candidate.reference),
+-                });
+-                continue;
+-            }
+-        };
+-        let library = match parse_library_footprint(&candidate.library_id, &source) {
+-            Ok(library) => library,
+-            Err(error) => {
+-                diagnostics.push(UpdateDiagnostic {
+-                    code: "unsupported_library_footprint".to_string(),
++                    code: "footprint_update_conflict".into(),
+                     message: format!("{error:#}"),
+                     reference: Some(candidate.reference),
+                 });
+                 continue;
+             }
+         };
+-        let prepared =
+-            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
+-                Ok(prepared) => prepared,
+-                Err(error) => {
+-                    diagnostics.push(UpdateDiagnostic {
+-                        code: "footprint_update_conflict".to_string(),
+-                        message: format!("{error:#}"),
+-                        reference: Some(candidate.reference),
+-                    });
+-                    continue;
+-                }
+-            };
++        if !prepared.moved_routed_pads.is_empty() && !filters.allow_routed_pad_movement {
++            diagnostics.push(UpdateDiagnostic { code: "routed_pad_movement_requires_opt_in".into(), message: format!("{} pads {:?} move on routed nets; copper geometry stays unchanged and may become unconnected. Review and set allow_routed_pad_movement=true; run DRC/reconnect afterwards", candidate.reference, prepared.moved_routed_pads), reference: Some(candidate.reference) });
++            continue;
++        }
++        if filters.scope == UpdateScope::Models {
++            let updated =
++                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
++                    .expect("prepared typed item");
++            match (konnect_ipc::KiCadIpcClient::footprint_3d_models(&candidate.instance), konnect_ipc::KiCadIpcClient::footprint_3d_models(&updated)) {
++                (Ok(before), Ok(after)) => model_inspections.push(json!({ "reference": candidate.reference, "library_id": candidate.library_id, "before": before, "after": after })),
++                (before, after) => { diagnostics.push(UpdateDiagnostic { code: "model_inspection_failed".into(), message: format!("before: {before:?}; after: {after:?}"), reference: Some(candidate.reference) }); continue; }
++            }
++        }
+ 
+         hasher.update(candidate.item.type_url.as_bytes());
+         hasher.update(&candidate.item.value);
+@@ -905,6 +1064,7 @@
+                 library_id: candidate.library_id,
+                 changed_domains: prepared.changed_domains,
+                 preserved: prepared.preserved,
++                moved_routed_pads: prepared.moved_routed_pads,
+             });
+             prepared_items.push(prepared.item);
+         }
+@@ -922,6 +1082,7 @@
+             changes,
+             diagnostics,
+             prepared_items,
++            model_inspections,
+         };
+     }
+ 
+@@ -937,6 +1098,7 @@
+         changes,
+         diagnostics,
+         prepared_items,
++        model_inspections,
+     }
+ }
+ 
+@@ -1691,12 +1853,7 @@
+         .as_ref()
+         .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
+         .unwrap_or_default();
+-    if current_id != library.library_id {
+-        bail!(
+-            "board footprint library id '{current_id}' does not match '{}'",
+-            library.library_id
+-        );
+-    }
++    let replacing = current_id != library.library_id;
+ 
+     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
+     for item in &current_definition.items {
+@@ -1716,6 +1873,27 @@
+                     existing.name,
+                     net.name
+                 );
++            }
++        }
++    }
++    if replacing {
++        for number in old_nets.keys() {
++            let old_count = current_definition
++                .items
++                .iter()
++                .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
++                .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()))
++                .collect::<Result<Vec<_>, _>>()?
++                .iter()
++                .filter(|pad| &pad.number == number)
++                .count();
++            let new_count = library
++                .pads
++                .iter()
++                .filter(|pad| &pad.number == number)
++                .count();
++            if old_count != 1 || new_count != 1 {
++                bail!("replacement requires a unique mapping for connected pad {number}; old count {old_count}, new count {new_count}");
+             }
+         }
+     }
+@@ -1796,7 +1974,9 @@
+             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+         }),
+     );
++    let mut moved_routed_pads = Vec::new();
+     let mut pad_index = 0;
++    let mut pad_occurrences = BTreeMap::<String, usize>::new();
+     for item in &mut definition.items {
+         if item.type_url.ends_with("kiapi.board.types.Pad") {
+             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+@@ -1806,6 +1986,33 @@
+                 .context("library pad override count differs from typed pads")?
+                 .apply(&mut pad)?;
+             pad_index += 1;
++            let matching = current_definition
++                .items
++                .iter()
++                .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
++                .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()))
++                .collect::<Result<Vec<_>, _>>()?
++                .into_iter()
++                .filter(|old| old.number == pad.number)
++                .collect::<Vec<_>>();
++            // Stable occurrence mapping also handles same-number physical pads
++            // during same-ID refresh, without assigning one old UUID twice.
++            let occurrence = pad_occurrences.entry(pad.number.clone()).or_default();
++            let old = matching.get(*occurrence);
++            *occurrence += 1;
++            if let Some(old) = old {
++                pad.id = old.id.clone();
++                pad.symbol_pin = old.symbol_pin.clone();
++                pad.locked = old.locked;
++                if old.position != pad.position
++                    && old
++                        .net
++                        .as_ref()
++                        .is_some_and(|net| routed_nets.contains(&net.name))
++                {
++                    moved_routed_pads.push(pad.number.clone());
++                }
++            }
+             pad.net = old_nets
+                 .get(&pad.number)
+                 .map(|old| kiapi::board::types::Net {
+@@ -1856,6 +2063,39 @@
+         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
+         changed_domains,
+         preserved,
++        moved_routed_pads,
++    })
++}
++
++fn build_model_update(
++    current: &kiapi::board::types::FootprintInstance,
++    source: &str,
++) -> Result<PreparedUpdate> {
++    let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
++    if root.head() != Some("footprint") {
++        bail!("library source root must be a footprint");
++    }
++    let models = super::library_footprint::models(&root)?;
++    let mut updated = current.clone();
++    let definition = updated
++        .definition
++        .as_mut()
++        .context("board footprint has no definition")?;
++    definition.items.retain(|item| {
++        !item
++            .type_url
++            .ends_with("kiapi.board.types.Footprint3DModel")
++    });
++    definition.items.extend(
++        models.iter().map(|model| {
++            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
++        }),
++    );
++    Ok(PreparedUpdate {
++        changed_domains: changed_domains(current, &updated)?,
++        preserved: PreservedState::derive(current, &updated, &BTreeMap::new()),
++        moved_routed_pads: Vec::new(),
++        item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
+     })
+ }
+ 
+@@ -2151,6 +2391,9 @@
+         .as_ref()
+         .context("missing updated definition")?;
+ 
++    if current_definition.id != updated_definition.id {
++        changed.insert(ChangedDomain::LibraryId);
++    }
+     let current_pads = normalized_items(current_definition, "Pad")?;
+     let updated_pads = normalized_items(updated_definition, "Pad")?;
+     if current_pads != updated_pads {
+@@ -3184,6 +3427,71 @@
+     }
+ 
+     #[test]
++    fn replacement_preserves_instance_and_maps_connected_pad_numbers() {
++        let source = LIBRARY_FOOTPRINT.replace(
++            "  (pad \"1\" smd rect (at -1 0) (size 1 1) (layers \"B.Cu\"))",
++            "",
++        );
++        let library = parse_library_footprint("Test:Replacement", &source).unwrap();
++        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
++        let before = current.encode_to_vec();
++        let prepared =
++            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
++        let updated =
++            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
++        assert_eq!(updated.id, current.id);
++        assert_eq!(updated.position, current.position);
++        assert_eq!(updated.orientation, current.orientation);
++        assert_eq!(updated.layer, current.layer);
++        assert_eq!(updated.symbol_path, current.symbol_path);
++        assert_eq!(decoded_pads(&updated)[0].net, decoded_pads(&current)[0].net);
++        assert_eq!(
++            updated
++                .definition
++                .as_ref()
++                .unwrap()
++                .id
++                .as_ref()
++                .unwrap()
++                .entry_name,
++            "Replacement"
++        );
++        assert_eq!(current.encode_to_vec(), before);
++    }
++
++    #[test]
++    fn fifty_seven_model_refreshes_are_one_bulk_plan() {
++        let (_temp, board, _) = plan_fixture();
++        let items = (1..=57)
++            .map(|n| plan_item(&format!("U{n}"), Some("Test:Socket"), &format!("id-{n}")))
++            .collect::<Vec<_>>();
++        let filters = parse_filters(&json!({"scope": "models"})).unwrap();
++        let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
++        assert_eq!(plan.status, PlanStatus::Ready);
++        assert_eq!(plan.prepared_items.len(), 57);
++        for change in &plan.changes {
++            assert_eq!(
++                change.changed_domains,
++                BTreeSet::from([ChangedDomain::Models])
++            );
++        }
++        assert_eq!(plan.model_inspections.len(), 57);
++        for after in &plan.prepared_items {
++            let after =
++                kiapi::board::types::FootprintInstance::decode(after.value.as_slice()).unwrap();
++            let before = items
++                .iter()
++                .map(|item| {
++                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
++                })
++                .find(|fp| fp.id == after.id)
++                .unwrap();
++            assert_eq!(before.id, after.id);
++            assert_eq!(decoded_pads(&before), decoded_pads(&after));
++        }
++    }
++
++    #[test]
+     fn seventy_two_instances_include_sixty_six_formerly_rejected_pad_settings() {
+         for index in 0..72 {
+             let source = if index < 66 {
+@@ -3214,60 +3522,29 @@
+         let source = LIBRARY_FOOTPRINT.replace("(roundrect_rratio 0.2))",
+             "(roundrect_rratio 0.2) (solder_mask_margin 0.075) (solder_paste_margin -0.02) (solder_paste_margin_ratio -0.15) (clearance 0.12) (die_length 0.8) (zone_connect 2) (thermal_bridge_width 0.3) (thermal_gap 0.25) (thermal_bridge_angle 37.5))");
+         let library = parse_library_footprint("Test:Socket", &source).unwrap();
+-        for side in [
+-            kiapi::board::types::BoardLayer::BlFCu,
+-            kiapi::board::types::BoardLayer::BlBCu,
+-        ] {
++        for side in [kiapi::board::types::BoardLayer::BlFCu, kiapi::board::types::BoardLayer::BlBCu] {
+             for rotation in [0.0, 37.0, 90.0, 180.0, 270.0] {
+                 let mut current = current_instance(side);
+-                current.orientation = Some(kiapi::common::types::Angle {
+-                    value_degrees: rotation,
+-                });
+-                let prepared =
+-                    build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+-                        .unwrap();
+-                let updated =
+-                    kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+-                        .unwrap();
++                current.orientation = Some(kiapi::common::types::Angle { value_degrees: rotation });
++                let prepared = build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
++                let updated = kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+                 let pad = decoded_pads(&updated).remove(0);
+                 assert_eq!(pad.copper_clearance_override.unwrap().value_nm, 120_000);
+                 assert_eq!(pad.pad_to_die_length.unwrap().value_nm, 800_000);
+                 let stack = pad.pad_stack.unwrap();
+-                for outer in [
+-                    stack.front_outer_layers.unwrap(),
+-                    stack.back_outer_layers.unwrap(),
+-                ] {
+-                    assert_eq!(
+-                        outer
+-                            .solder_mask_settings
+-                            .unwrap()
+-                            .solder_mask_margin
+-                            .unwrap()
+-                            .value_nm,
+-                        75_000
+-                    );
++                for outer in [stack.front_outer_layers.unwrap(), stack.back_outer_layers.unwrap()] {
++                    assert_eq!(outer.solder_mask_settings.unwrap().solder_mask_margin.unwrap().value_nm, 75_000);
+                     let paste = outer.solder_paste_settings.unwrap();
+                     assert_eq!(paste.solder_paste_margin.unwrap().value_nm, -20_000);
+                     assert_eq!(paste.solder_paste_margin_ratio.unwrap().value, -0.15);
+                 }
+                 let zone = stack.zone_settings.unwrap();
+-                assert_eq!(
+-                    zone.zone_connection,
+-                    kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32
+-                );
++                assert_eq!(zone.zone_connection, kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32);
+                 let thermal = zone.thermal_spokes.unwrap();
+                 assert_eq!(thermal.width.unwrap().value_nm, 300_000);
+                 assert_eq!(thermal.gap.unwrap().value_nm, 250_000);
+                 assert_eq!(thermal.angle.unwrap().value_degrees, 37.5);
+-                assert!(build_updated_instance(
+-                    &updated,
+-                    &library,
+-                    &BTreeMap::new(),
+-                    &BTreeSet::new()
+-                )
+-                .unwrap()
+-                .changed_domains
+-                .is_empty());
++                assert!(build_updated_instance(&updated, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap().changed_domains.is_empty());
+             }
+         }
+     }
+@@ -3278,12 +3555,7 @@
+         let explicit = konnect_sexp::parse_sexp("(pad 1 smd rect (solder_mask_margin 0) (solder_paste_margin 0) (solder_paste_margin_ratio 0) (thermal_bridge_angle 0) (thermal_gap 0) (thermal_bridge_width 0) (zone_connect 0) (clearance 0) (die_length 0))").unwrap();
+         let absent = PadOverrides::parse(&omitted).unwrap();
+         let zero = PadOverrides::parse(&explicit).unwrap();
+-        assert!(
+-            absent.mask.is_none()
+-                && absent.paste.is_none()
+-                && absent.paste_ratio.is_none()
+-                && absent.thermal_angle.is_none()
+-        );
++        assert!(absent.mask.is_none() && absent.paste.is_none() && absent.paste_ratio.is_none() && absent.thermal_angle.is_none());
+         assert_eq!(zero.mask.unwrap().value_nm, 0);
+         assert_eq!(zero.paste.unwrap().value_nm, 0);
+         assert_eq!(zero.paste_ratio.unwrap().value, 0.0);
+@@ -3292,10 +3564,7 @@
+         assert_eq!(zero.thermal_width.unwrap().value_nm, 0);
+         assert_eq!(zero.clearance.unwrap().value_nm, 0);
+         assert_eq!(zero.die_length.unwrap().value_nm, 0);
+-        assert_eq!(
+-            zero.zone,
+-            Some(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32)
+-        );
++        assert_eq!(zero.zone, Some(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32));
+     }
+ 
+     #[test]
+@@ -3304,10 +3573,7 @@
+             ("(solder_mask_margin nan)", "solder_mask_margin"),
+             ("(solder_mask_margin 0 1)", "solder_mask_margin"),
+             ("(solder_mask_margin 1e99)", "solder_mask_margin"),
+-            (
+-                "(solder_mask_margin 0) (solder_mask_margin 0.1)",
+-                "solder_mask_margin",
+-            ),
++            ("(solder_mask_margin 0) (solder_mask_margin 0.1)", "solder_mask_margin"),
+             ("(thermal_bridge_angle inf)", "thermal_bridge_angle"),
+             ("(thermal_gap -1)", "thermal_gap"),
+             ("(thermal_bridge_width -1)", "thermal_bridge_width"),
+@@ -3315,13 +3581,35 @@
+             ("(zone_connect 4)", "zone_connect"),
+             ("(solder_paste_margin_ratio 2)", "solder_paste_margin_ratio"),
+         ] {
+-            let source = LIBRARY_FOOTPRINT.replace(
+-                "(roundrect_rratio 0.2))",
+-                &format!("(roundrect_rratio 0.2) {clause})"),
+-            );
++            let source = LIBRARY_FOOTPRINT.replace("(roundrect_rratio 0.2))", &format!("(roundrect_rratio 0.2) {clause})"));
+             let error = parse_library_footprint("Test:Socket", &source).unwrap_err();
+             assert!(error.to_string().contains(field), "{error:#}");
+         }
++    }
++
++    #[test]
++    fn replacement_refuses_ambiguous_connected_pad_mapping_without_changing_input() {
++        let library = parse_library_footprint("Test:Replacement", LIBRARY_FOOTPRINT).unwrap();
++        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
++        let before = current.encode_to_vec();
++        let error = build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap_err();
++        assert!(error.to_string().contains("unique mapping for connected pad 1"), "{error:#}");
++        assert_eq!(before, current.encode_to_vec());
++    }
++
++    #[test]
++    fn model_only_update_preserves_every_non_model_byte_and_order() {
++        let mut current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
++        let source = LIBRARY_FOOTPRINT.replace("(roundrect_rratio 0.2))", "(roundrect_rratio 0.2) (unsupported_future_pad_clause 1))");
++        // Model refresh deliberately does not rebuild unrelated geometry.
++        let prepared = build_model_update(&current, &source).unwrap();
++        let mut updated = kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
++        assert_eq!(prepared.changed_domains, BTreeSet::from([ChangedDomain::Models]));
++        let again = build_model_update(&updated, &source).unwrap();
++        assert!(again.changed_domains.is_empty());
++        current.definition.as_mut().unwrap().items.retain(|item| !item.type_url.ends_with("Footprint3DModel"));
++        updated.definition.as_mut().unwrap().items.retain(|item| !item.type_url.ends_with("Footprint3DModel"));
++        assert_eq!(updated.encode_to_vec(), current.encode_to_vec());
+     }
+ 
+     #[test]
