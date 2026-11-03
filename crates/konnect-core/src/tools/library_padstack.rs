@@ -301,16 +301,9 @@ pub(super) fn render(stack: &Stack, layout: Option<(&str, &str, &str)>) -> Strin
         ),
         Some((nl, ind, unit)) => format!(
             "(padstack{nl}{ind}{unit}(mode {MODE}){nl}{ind}{unit}{}{nl}{ind}{unit}{}{nl}{ind})",
-            render_layer(
-                "Inner",
-                &stack.inner,
-                Some((nl, &format!("{ind}{unit}"), unit))
-            ),
-            render_layer(
-                "B.Cu",
-                &stack.back,
-                Some((nl, &format!("{ind}{unit}"), unit))
-            ),
+            // The layer sits one unit in, its children two.
+            render_layer("Inner", &stack.inner, Some((nl, ind, unit))),
+            render_layer("B.Cu", &stack.back, Some((nl, ind, unit))),
         ),
     }
 }
@@ -551,21 +544,25 @@ pub(super) fn apply(
     }
 }
 
-/// (newline, child indent, indent unit) of a multi-line pad block.
+/// (newline, child indent, indent unit) of a multi-line pad block, taken from
+/// the last child that starts on its own line (a child appended inline, such
+/// as ` (drill 0.8)`, says nothing about indentation). `None` for a one-line
+/// pad.
 fn layout_of(pad_block: &str) -> Option<(String, String, String)> {
-    if !pad_block.contains('\n') {
-        return None;
-    }
     let nl = if pad_block.contains("\r\n") {
         "\r\n"
     } else {
         "\n"
     };
-    let (s, _, _) = children(pad_block).into_iter().last()?;
-    let ws = &pad_block[leading_whitespace_start(pad_block, s)..s];
-    let ind = ws.rsplit('\n').next().unwrap_or("").to_string();
-    let unit = if ind.contains('\t') { "\t" } else { "  " };
-    Some((nl.to_string(), ind, unit.to_string()))
+    for (s, _, _) in children(pad_block).into_iter().rev() {
+        let ws = &pad_block[leading_whitespace_start(pad_block, s)..s];
+        if ws.contains('\n') {
+            let ind = ws.rsplit('\n').next().unwrap_or("").to_string();
+            let unit = if ind.contains('\t') { "\t" } else { "  " };
+            return Some((nl.to_string(), ind, unit.to_string()));
+        }
+    }
+    None
 }
 
 pub(super) struct Readback {
@@ -634,8 +631,15 @@ fn read_inner(pad: &SexpNode) -> Result<Readback, String> {
     let header_shape = node_str(pad, 3).ok_or("pad has no shape")?;
     // The header is the front layer: its size and roundrect ratio are the front's.
     let mut header = layer_json("F.Cu", header_shape, pad, false)?;
-    if pad.find("offset").is_some() {
-        header["unmodelled"] = json!(["offset"]);
+    let header_extra: Vec<&str> = pad
+        .children()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(SexpNode::head)
+        .filter(|h| HEADER_UNSUPPORTED.contains(h))
+        .collect();
+    if !header_extra.is_empty() {
+        header["unmodelled"] = json!(header_extra);
     }
     let layers: Vec<(String, &SexpNode)> = stack
         .children()

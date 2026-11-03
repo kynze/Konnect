@@ -577,3 +577,163 @@ async fn an_unreadable_or_unknown_stack_fails_readback() {
         );
     }
 }
+
+async fn set_padstack(server: &McpHandler, path: &Path, pad: &str, stack: serde_json::Value) {
+    let r = call(
+        server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":pad,"padstack":stack}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+}
+
+fn lf(text: &str) -> String {
+    text.replace("\r\n", "\n")
+}
+
+#[tokio::test]
+async fn reapplying_the_same_stack_to_a_kicad_pad_is_byte_identical_in_every_line_ending() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let base = lf(NATIVE_FRONT_INNER_BACK);
+    for (name, source) in [
+        ("native", base.clone()),
+        ("crlf", base.replace('\n', "\r\n")),
+        ("spaces", base.replace('\t', "  ")),
+    ] {
+        let path = dir.path().join(format!("{name}.kicad_mod"));
+        std::fs::write(&path, &source).unwrap();
+        set_padstack(&server, &path, "1", fixture_stack()).await;
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            source,
+            "{name}: KiCad's own formatting must survive an identical edit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_changed_layer_is_written_with_the_files_own_indentation() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let base = lf(NATIVE_FRONT_INNER_BACK);
+    let path = dir.path().join("Native.kicad_mod");
+    std::fs::write(&path, &base).unwrap();
+    let mut stack = fixture_stack();
+    stack["inner"] = layer("oval", 1.4, 1.0);
+    set_padstack(&server, &path, "1", stack).await;
+    let expected = base.replacen(
+        "\t\t\t\t(shape circle)\n\t\t\t\t(size 1.2 1.2)",
+        "\t\t\t\t(shape oval)\n\t\t\t\t(size 1.4 1)",
+        1,
+    );
+    assert_ne!(expected, base);
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+}
+
+#[tokio::test]
+async fn a_new_stack_on_a_multi_line_crlf_pad_follows_its_indentation() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Hole.kicad_mod");
+    let source = include_str!("../../tests/fixtures/pad_zone_connect_kicad10.kicad_mod");
+    assert!(source.contains("\r\n"), "fixture is CRLF");
+    std::fs::write(&path, source).unwrap();
+    let stack = json!({"mode":"front_inner_back",
+        "front":layer("circle",3.6,3.6),"inner":layer("circle",3.0,3.0),
+        "back":layer("circle",3.6,3.6)});
+    // Three pads are numbered 1; only the first match (the thru_hole one) is edited.
+    set_padstack(&server, &path, "1", stack).await;
+    let after = std::fs::read_to_string(&path).unwrap();
+    let block = "\t\t(padstack\r\n\t\t\t(mode front_inner_back)\r\n\t\t\t(layer \"Inner\"\r\n\t\t\t\t(shape circle)\r\n\t\t\t\t(size 3 3)\r\n\t\t\t)\r\n\t\t\t(layer \"B.Cu\"\r\n\t\t\t\t(shape circle)\r\n\t\t\t\t(size 3.6 3.6)\r\n\t\t\t)\r\n\t\t)\r\n\t)";
+    assert!(after.contains(block), "{after}");
+    assert_eq!(after.matches("(padstack").count(), 1);
+    // Removing exactly that block gives back the original file.
+    assert_eq!(
+        after.replacen(&format!("\r\n{block}"), "\r\n\t)", 1),
+        source
+    );
+}
+
+#[tokio::test]
+async fn match_all_new_number_and_zone_connect_combine_with_a_padstack() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Dups.kicad_mod");
+    let r = call(
+        &server,
+        "create_footprint",
+        json!({"output":path,"name":"Dups","pads":[
+            th_pad("1", 0.0, json!({})), th_pad("2", 3.0, json!({})), th_pad("1", 6.0, json!({}))]}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"1","match_all":true,"new_number":"7",
+               "zone_connect":"solid","drill":0.9,"padstack":fixture_stack()}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let got = info(&server, &path).await;
+    let pads = got["pads"].as_array().unwrap();
+    assert_eq!(pads[0]["number"], "7");
+    assert_eq!(pads[2]["number"], "7");
+    assert_eq!(pads[1]["number"], "2");
+    for i in [0, 2] {
+        assert_eq!(pads[i]["padstack"]["mode"], "front_inner_back", "pad {i}");
+        assert_eq!(
+            pads[i]["drill"]["size"],
+            json!({"x":0.9,"y":0.9}),
+            "pad {i}"
+        );
+    }
+    assert_eq!(pads[1]["padstack"]["mode"], "normal");
+    assert_eq!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .matches("(zone_connect 2)")
+            .count(),
+        2
+    );
+    // Without match_all only the first match changes.
+    let single = dir.path().join("Single.kicad_mod");
+    std::fs::copy(&path, &single).unwrap();
+    let mut other = fixture_stack();
+    other["inner"] = layer("oval", 1.4, 1.0);
+    set_padstack(&server, &single, "7", other).await;
+    let got = info(&server, &single).await;
+    assert_eq!(got["pads"][0]["padstack"]["inner"]["shape"], "oval");
+    assert_eq!(got["pads"][2]["padstack"]["inner"]["shape"], "circle");
+}
+
+#[tokio::test]
+async fn header_tokens_konnect_does_not_model_are_reported_and_block_a_rewrite() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Chamfer.kicad_mod");
+    let base = lf(NATIVE_FRONT_INNER_BACK);
+    let source = base.replacen(
+        "(size 1.6 1.6)",
+        "(size 1.6 1.6)\n\t\t(chamfer_ratio 0.2)",
+        1,
+    );
+    assert_ne!(source, base);
+    std::fs::write(&path, &source).unwrap();
+    let got = info(&server, &path).await;
+    assert!(got["pads"][0]["padstack"]["front"]["unmodelled"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("chamfer_ratio")));
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"1","padstack":fixture_stack()}),
+    )
+    .await;
+    assert!(is_error(&r), "{r}");
+    assert!(err_text(&r).contains("chamfer_ratio"), "{}", err_text(&r));
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+}
