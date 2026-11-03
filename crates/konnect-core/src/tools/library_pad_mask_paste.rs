@@ -76,7 +76,7 @@ impl Spec {
 
 /// Format an integer count of millionths as a KiCad number: no exponent, no
 /// trailing zeros, `0` for zero.
-fn format_micro(micro: i64) -> String {
+pub(super) fn format_micro(micro: i64) -> String {
     if micro == 0 {
         return "0".into();
     }

@@ -16,8 +16,15 @@ use konnect_sexp::writer::{
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+#[path = "library_padstack_tests.rs"]
+mod padstack_tests;
+
 #[path = "library_pad_mask_paste.rs"]
 mod pad_mask_paste;
+
+#[path = "library_padstack.rs"]
+mod padstack;
 
 #[cfg(test)]
 #[path = "library_pad_mask_paste_tests.rs"]
@@ -99,6 +106,21 @@ fn pin_item_schema(type_desc: &str, require_xy: bool) -> serde_json::Value {
     })
 }
 
+/// One copper layer of a `padstack` argument.
+fn padstack_layer_schema() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "shape": { "type": "string", "enum": ["circle", "rect", "oval", "roundrect"] },
+            "width": { "type": "number", "description": "mm, > 0 and <= 100" },
+            "height": { "type": "number", "description": "mm, > 0 and <= 100" },
+            "roundrect_rratio": { "type": "number", "minimum": 0, "maximum": 0.5, "description": "Only with shape roundrect" }
+        },
+        "required": ["shape", "width", "height"],
+        "additionalProperties": false
+    })
+}
+
 pub fn tools() -> Vec<ToolDef> {
     let mut tools = vec![
         tool!(
@@ -138,6 +160,18 @@ pub fn tools() -> Vec<ToolDef> {
                                     "minimum": 0,
                                     "maximum": 0.5,
                                     "description": "Rounded-rectangle corner radius ratio (0..0.5)"
+                                },
+                                "padstack": {
+                                    "type": ["object", "null"],
+                                    "description": "Per-layer copper for a thru_hole pad (KiCad padstack mode front_inner_back). front/inner/back must all be given; the pad's shape/width/height/roundrect_rratio must equal front. Omit or null for an ordinary pad.",
+                                    "properties": {
+                                        "mode": { "type": "string", "enum": ["front_inner_back"] },
+                                        "front": padstack_layer_schema(),
+                                        "inner": padstack_layer_schema(),
+                                        "back": padstack_layer_schema()
+                                    },
+                                    "required": ["mode", "front", "inner", "back"],
+                                    "additionalProperties": false
                                 },
                                 "solder_mask_margin": {
                                     "type": ["number", "null"],
@@ -195,6 +229,18 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
                     "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "padstack": {
+                        "type": ["object", "null"],
+                        "description": "Per-layer copper for a thru_hole pad (KiCad padstack mode front_inner_back). Omit to leave unchanged; null returns a stack Konnect can read completely to an ordinary pad; an object sets front/inner/back (all required) and rewrites the pad header from front. Custom stacks and stacks with tokens Konnect does not model are refused, never flattened. shape/width/height edits on a padstack pad are refused unless they equal padstack.front.",
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["front_inner_back"] },
+                            "front": padstack_layer_schema(),
+                            "inner": padstack_layer_schema(),
+                            "back": padstack_layer_schema()
+                        },
+                        "required": ["mode", "front", "inner", "back"],
+                        "additionalProperties": false
+                    },
                     "solder_mask_margin": {
                         "type": ["number", "null"],
                         "description": "Pad-local solder-mask margin in mm (|v| <= 10). Omit to leave unchanged; null removes the override so the pad inherits. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
@@ -871,6 +917,17 @@ async fn handle_create_footprint(
         let mask_paste = pad_mask_paste::parse(pad, "", false)
             .expect("validated")
             .create_tokens();
+        // Validated above: the header describes the front layer, the stack follows.
+        let (roundrect_ratio, mask_paste) = match pad
+            .get("padstack")
+            .map(|value| padstack::parse(value, "", false).expect("validated"))
+        {
+            Some(padstack::Change::Set(stack)) => (
+                padstack::header_ratio_token(&stack),
+                format!("{mask_paste} {}", padstack::render(&stack, None)),
+            ),
+            _ => (roundrect_ratio, mask_paste),
+        };
         pad_sexp.push_str(&format!(
             "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {}{})",
             number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio, mask_paste
@@ -954,6 +1011,32 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
         if let Err((field, reason)) = pad_mask_paste::parse(pad, &format!("pads[{index}]."), false)
         {
             return Err(invalid_library_argument(&field, reason));
+        }
+        if let Some(value) = pad.get("padstack") {
+            match padstack::parse(value, &format!("pads[{index}].padstack"), false) {
+                Err((field, reason)) => return Err(invalid_library_argument(&field, reason)),
+                Ok(padstack::Change::Set(stack)) => {
+                    let field = format!("pads[{index}].padstack");
+                    let pad_type = pad["type"].as_str().unwrap_or_default();
+                    let layers: Vec<&str> = match pad["layers"].as_array() {
+                        Some(layers) => layers.iter().filter_map(|l| l.as_str()).collect(),
+                        None if pad_type == "smd" => vec!["F.Cu", "F.Paste", "F.Mask"],
+                        None => vec!["*.Cu", "*.Mask"],
+                    };
+                    padstack::check_create_pad(pad_type, &layers)
+                        .and_then(|()| {
+                            padstack::check_header(
+                                &stack,
+                                pad["shape"].as_str(),
+                                pad["width"].as_f64(),
+                                pad["height"].as_f64(),
+                                pad["roundrect_rratio"].as_f64(),
+                            )
+                        })
+                        .map_err(|reason| invalid_library_argument(&field, reason))?;
+                }
+                Ok(_) => {}
+            }
         }
     }
     Ok(())
@@ -1042,6 +1125,27 @@ async fn handle_edit_footprint_pad(
         Ok(spec) => spec,
         Err((field, reason)) => return Ok(invalid_library_argument(&field, reason)),
     };
+    // Omission leaves the stack alone; null returns it to an ordinary pad.
+    let padstack_change = match args.get("padstack") {
+        None => padstack::Change::Keep,
+        Some(value) => match padstack::parse(value, "padstack", true) {
+            Ok(change) => change,
+            Err((field, reason)) => return Ok(invalid_library_argument(&field, reason)),
+        },
+    };
+    if let padstack::Change::Set(stack) = &padstack_change {
+        if let Err(reason) = padstack::check_header(
+            stack,
+            shape,
+            args["width"].as_f64(),
+            args["height"].as_f64(),
+            None,
+        ) {
+            return Ok(invalid_library_argument("padstack", reason));
+        }
+    }
+    let header_edit =
+        shape.is_some() || args["width"].as_f64().is_some() || args["height"].as_f64().is_some();
 
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
@@ -1078,6 +1182,11 @@ async fn handle_edit_footprint_pad(
         }
 
         matched_count += 1;
+        if header_edit && padstack_change == padstack::Change::Keep {
+            if let Err(reason) = padstack::guard_header_edit(block, pad_number) {
+                return Ok(invalid_library_argument("padstack", reason));
+            }
+        }
         let mut edited = match edit_footprint_pad_block(block, args, new_number, shape) {
             Ok(edited) => edited,
             Err(reason) => return Ok(invalid_library_argument("shape", reason)),
@@ -1087,6 +1196,18 @@ async fn handle_edit_footprint_pad(
             observed_zone_connects.push(
                 PadZoneConnect::of_pad(&edited).map_or("unrecognized", PadZoneConnect::as_str),
             );
+        }
+        if padstack_change != padstack::Change::Keep {
+            edited = match padstack::apply(edited, &padstack_change, pad_number) {
+                Ok(edited) => edited,
+                Err(reason) => return Ok(invalid_library_argument("padstack", reason)),
+            };
+            // Verified before the write, so a failure leaves the file as it was.
+            if let Err(reason) = padstack::verify(&edited, &padstack_change) {
+                return Ok(CallToolResult::error(format!(
+                    "Pad '{pad_number}' was not written: {reason}"
+                )));
+            }
         }
         if !mask_paste.is_empty() {
             edited = pad_mask_paste::apply(edited, &mask_paste);
@@ -4983,6 +5104,7 @@ async fn handle_get_footprint_info(
     if args["include_pads"].as_bool().unwrap_or(false) {
         let mut pads = Vec::with_capacity(pad_count);
         let mut mask_paste = Vec::with_capacity(pad_count);
+        let mut padstacks = Vec::with_capacity(pad_count);
         for pad in footprint
             .children()
             .unwrap_or(&[])
@@ -5026,17 +5148,32 @@ async fn handle_get_footprint_info(
                     )))
                 }
             }
+            match padstack::read_pad(pad) {
+                Ok(read) => padstacks.push(read),
+                Err(error) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Could not read pad '{pad_number}': {error}"
+                    )))
+                }
+            }
             pads.push(info);
         }
         response["coordinate_space"] = json!("footprint_local");
         let mut pads_json = serde_json::to_value(pads)?;
-        for (pad_json, read) in pads_json
+        for ((pad_json, read), stack) in pads_json
             .as_array_mut()
             .into_iter()
             .flatten()
             .zip(mask_paste)
+            .zip(padstacks)
         {
             pad_json["mask_paste"] = read;
+            pad_json["padstack"] = stack.padstack;
+            // The header geometry is only the front layer: replace the
+            // `*.Cu` copy of it with the stack's real per-layer geometry.
+            if let Some(layers) = stack.copper_layers {
+                pad_json["copper_layers"] = json!(layers);
+            }
         }
         response["pads"] = pads_json;
     }
