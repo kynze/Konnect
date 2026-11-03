@@ -53,3 +53,14 @@ Also run: rustfmt --check on both new files (clean) and on library.rs for the ed
 - `crates/konnect/assets/skills/kicad-library/SKILL.md` does not yet mention the new fields (unowned shared file; follow-up).
 - The ranges above are Konnect guards, not KiCad limits.
 - Task binary: `C:/tmp/konnect-ailab41-target/debug/konnect.exe` (debug, not a release build).
+
+## Independent review follow-up (2026-11-03, reviewer read c85390a; no serious findings)
+
+Changed after review:
+- `verify` now checks only the fields the edit changes, so a malformed token on an unrelated field no longer blocks the edit (test `a_malformed_token_elsewhere_does_not_block_an_unrelated_setting`; not observed red before the change).
+- The `edit_footprint_pad` response reports the pad's own values only (`mask_paste.<field>.local`) and no longer shows `source: unknown` / `effective: null` for an inherited value that the footprint may in fact supply; identical pads are de-duplicated by value, not by adjacency.
+- Tests added or fixed: unrelated edit keeps every existing token byte-for-byte; duplicate tokens collapse and readback follows the last one (as KiCad does); exponent and sub-nanometre input rounds to whole nanometres with no exponent form written; match_all response shape. The misnamed test was renamed and its dead code removed.
+
+Reviewer doubt refuted natively: a footprint-level `(solder_mask_margin 0)` (and paste margin / ratio) is also read as unset by KiCad 10.0.6 (`pcbnew` prints `None None None`, and native save writes none of the tokens), so reporting it as inherited with `footprint_token_zero: true` is correct. This is now phase 5 of `tests/ailab41_native_roundtrip.py` (5 PASS lines in total).
+
+Counts: `pad_mask_paste_tests` 15 passed; library group once, isolated TEMP: **194 passed, 0 failed**. Remaining stated limits: a malformed token on any pad still fails the whole `get_footprint_info include_pads` call (deliberate, so nothing is silently dropped); exactly-half-nanometre inputs depend on floating-point rounding; the zero refusal is reported before the range check.

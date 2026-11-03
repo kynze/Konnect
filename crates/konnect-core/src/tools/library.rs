@@ -1097,8 +1097,11 @@ async fn handle_edit_footprint_pad(
                 )));
             }
             if let Ok(node) = parse_sexp(&edited) {
-                if let Ok(read) = pad_mask_paste::read_pad(&node, &node) {
-                    observed_mask_paste.push(read);
+                if let Ok(read) = pad_mask_paste::read_local(&node) {
+                    // Not `dedup`: identical pads need not be adjacent.
+                    if !observed_mask_paste.contains(&read) {
+                        observed_mask_paste.push(read);
+                    }
                 }
             }
         }
@@ -1134,7 +1137,6 @@ async fn handle_edit_footprint_pad(
     }
     // Pad-local values as read back from the written pads. Inheritance beyond
     // the pad is not resolved here; get_footprint_info reports it.
-    observed_mask_paste.dedup();
     match observed_mask_paste.as_slice() {
         [] => {}
         [observed] => response["mask_paste"] = observed.clone(),
