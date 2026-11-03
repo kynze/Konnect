@@ -314,10 +314,12 @@ struct UpdatePlan {
 pub(crate) fn tool() -> ToolDef {
     tool!(
         "update_footprints_from_library",
-        "Plan or atomically apply KiCad's Update Footprints from Library operation to placed \
-         footprints on the live board. Defaults to a non-mutating dry run; apply requires its \
-         exact plan revision. Preserves placed-instance state and pad nets while refreshing \
-         supported library-owned content.",
+        "Plan or apply KiCad's Update Footprints from Library operation to placed footprints \
+         on the live board. Defaults to a non-mutating dry run; apply requires its exact plan \
+         revision. Apply is one KiCad commit (one Ctrl-Z) that is verified by reading the \
+         board back; if the readback differs, a second commit restores the previous footprints \
+         and the call fails saying whether the rollback was confirmed. Preserves \
+         placed-instance state and pad nets while refreshing supported library-owned content.",
         json!({
             "type": "object",
             "properties": {
@@ -443,6 +445,7 @@ pub(crate) async fn handle_update_footprints_from_library(
 
             let update_count = plan.prepared_items.len();
             let expected_items = std::mem::take(&mut plan.prepared_items);
+            let mut originals = Vec::new();
             client.run_commit("Update footprints from libraries", |client| {
                 // Acquire the native undo scope before the final stale check.
                 let latest_items = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
@@ -452,10 +455,16 @@ pub(crate) async fn handle_update_footprints_from_library(
                 if latest.status == PlanStatus::Conflict || latest.plan_revision != plan.plan_revision {
                     bail!("stale footprint plan immediately before mutation; no update sent; inspect and replan");
                 }
+                // What the board holds right now, kept so a failed verification can be undone.
+                originals = originals_of(&expected_items, &latest_items)?;
                 client.update_items_in(document.clone(), expected_items.clone())?;
-                let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
-                verify_updated_items(&expected_items, &observed)
+                Ok(())
             })?;
+            // KiCad 10.0.6 keeps an update pending until its commit is pushed: a readback inside
+            // the commit still shows the old footprints. The update is therefore verified after
+            // the push, and a mismatch is undone with a second commit that puts back the
+            // footprints captured above (the IPC API has no undo of its own).
+            verify_published_update(client, &document, &expected_items, &originals)?;
             plan.coverage.selected.applied = plan.coverage.selected.planned;
             plan.coverage.changed.applied = update_count;
             plan.coverage.unchanged.applied = plan.coverage.unchanged.planned;
@@ -474,6 +483,78 @@ pub(crate) async fn handle_update_footprints_from_library(
         )),
         BoardWrite::Refused(result) => result,
     })
+}
+
+/// The live footprints that `updated` is about to replace, matched by identity.
+fn originals_of(
+    updated: &[prost_types::Any],
+    live: &[prost_types::Any],
+) -> Result<Vec<prost_types::Any>> {
+    let identity = |item: &prost_types::Any| -> Result<Option<String>> {
+        Ok(
+            kiapi::board::types::FootprintInstance::decode(item.value.as_slice())?
+                .id
+                .map(|id| id.value),
+        )
+    };
+    updated
+        .iter()
+        .map(|item| {
+            let wanted = identity(item)?.context("updated footprint has no identity")?;
+            for candidate in live {
+                if identity(candidate)?.as_deref() == Some(wanted.as_str()) {
+                    return Ok(candidate.clone());
+                }
+            }
+            bail!("footprint {wanted} is missing from the live board, so it could not be restored")
+        })
+        .collect()
+}
+
+/// Verify a pushed update against the live board; undo it if it does not match.
+///
+/// Outcomes are reported as they are: a confirmed restore says "rolled back", an unconfirmed
+/// one says the board may be partly updated and tells the user how to recover in KiCad.
+fn verify_published_update(
+    client: &konnect_ipc::KiCadIpcClient,
+    document: &kiapi::common::types::DocumentSpecifier,
+    expected: &[prost_types::Any],
+    originals: &[prost_types::Any],
+) -> Result<()> {
+    use kiapi::common::types::KiCadObjectType as ObjectType;
+
+    let observed = client
+        .get_items_in(document.clone(), ObjectType::KotPcbFootprint)
+        .context(
+            "the update was published to KiCad but reading the board back failed, so it is \
+             unverified and was not undone; check the board in KiCad (Edit > Undo reverts it) \
+             before saving",
+        )?;
+    let mismatch = match verify_updated_items(expected, &observed) {
+        Ok(()) => return Ok(()),
+        Err(mismatch) => mismatch,
+    };
+    let restored = client
+        .run_commit(
+            "Restore footprints after a failed library update",
+            |client| client.update_items_in(document.clone(), originals.to_vec()),
+        )
+        .and_then(|_| {
+            let observed = client.get_items_in(document.clone(), ObjectType::KotPcbFootprint)?;
+            verify_updated_items(originals, &observed)
+        });
+    match restored {
+        Ok(()) => bail!(
+            "{mismatch:#}. The update was published, so Konnect put the previous footprints back \
+             in a second commit and a readback confirms the original state: rolled back, nothing \
+             was applied"
+        ),
+        Err(restore_error) => bail!(
+            "{mismatch:#}. Restoring the previous footprints could not be confirmed \
+             ({restore_error:#}), so the board may be partly updated. Do not save it: use \
+             Edit > Undo in KiCad (the restore, then the update) or close without saving"
+        ),
+    }
 }
 
 fn verify_updated_items(
@@ -505,7 +586,7 @@ fn verify_updated_items(
         let instance_differs = !instance_state_matches(&expected, actual);
         if instance_differs || !differing_domains.is_empty() {
             bail!(
-                "independent readback differs for footprint {} (instance state differs: {}; library-owned domains differing: {:?}; first difference: {}); native transaction must be dropped",
+                "independent readback differs for footprint {} (instance state differs: {}; library-owned domains differing: {:?}; first difference: {})",
                 field_text(&expected.reference_field),
                 instance_differs,
                 differing_domains,
@@ -522,19 +603,46 @@ fn verify_updated_items(
                 .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
                 .map(|item| {
                     let pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
+                    // A net is identified by its name: KiCad 10.0.6 returns the pad's net
+                    // without the internal net code that the plan carries.
                     Ok((
                         pad.number,
-                        pad.net.map(|net| net.encode_to_vec()).unwrap_or_default(),
+                        pad.net
+                            .map(|mut net| {
+                                net.code = None;
+                                net.encode_to_vec()
+                            })
+                            .unwrap_or_default(),
                     ))
                 })
                 .collect::<Result<Vec<_>>>()?;
             nets.sort();
             Ok(nets)
         };
-        if nets(&expected)? != nets(actual)? {
+        let (expected_nets, actual_nets) = (nets(&expected)?, nets(actual)?);
+        if expected_nets != actual_nets {
+            let describe = |nets: &[(String, Vec<u8>)], number: &str| {
+                nets.iter()
+                    .find(|(pad, _)| pad == number)
+                    .map(|(_, net)| {
+                        kiapi::board::types::Net::decode(net.as_slice())
+                            .map(|net| format!("{net:?}"))
+                            .unwrap_or_else(|_| "undecodable".to_string())
+                    })
+                    .unwrap_or_else(|| "missing".to_string())
+            };
+            let first = expected_nets
+                .iter()
+                .chain(actual_nets.iter())
+                .map(|(pad, _)| pad.as_str())
+                .find(|pad| describe(&expected_nets, pad) != describe(&actual_nets, pad))
+                .unwrap_or("?");
             bail!(
-                "pad-net readback differs for footprint {}",
-                field_text(&expected.reference_field)
+                "independent readback differs: pad-net readback differs for footprint {} (pad {}: expected {} / actual {})",
+                field_text(&expected.reference_field),
+                first,
+                describe(&expected_nets, first),
+                describe(&actual_nets, first)
             );
         }
     }
@@ -4231,6 +4339,13 @@ mod tests {
         )
     }
 
+    fn result_text(result: &crate::mcp::protocol::CallToolResult) -> String {
+        match result.content.first() {
+            Some(crate::mcp::protocol::ToolContent::Text { text }) => text.clone(),
+            other => panic!("expected text result, got {other:?}"),
+        }
+    }
+
     fn result_json(result: &crate::mcp::protocol::CallToolResult) -> serde_json::Value {
         let text = match result.content.first() {
             Some(crate::mcp::protocol::ToolContent::Text { text }) => text,
@@ -4350,14 +4465,17 @@ mod tests {
         footprint: prost_types::Any,
         fail_update: bool,
     ) -> PlannerMock {
-        spawn_planner_mock_batch(board, vec![footprint], fail_update, false)
+        spawn_planner_mock_batch(board, vec![footprint], fail_update, 0)
     }
 
+    /// Mirrors KiCad 10.0.6: updates sent inside a commit stay pending, so a readback taken
+    /// before the commit is pushed still shows the old footprints. `corrupt_commits` is how
+    /// many of the first pushed commits apply a mangled footprint instead of the one sent.
     fn spawn_planner_mock_batch(
         board: &Path,
         footprints: Vec<prost_types::Any>,
         fail_update: bool,
-        corrupt_readback: bool,
+        corrupt_commits: usize,
     ) -> PlannerMock {
         use nng::options::Options;
 
@@ -4377,7 +4495,8 @@ mod tests {
         let captured = capture.clone();
         let thread = std::thread::spawn(move || {
             let mut footprints = footprints;
-            let mut before_commit = None;
+            let mut pending: Vec<prost_types::Any> = Vec::new();
+            let mut pushed_commits = 0usize;
             captured.lock().unwrap().final_items = footprints.clone();
             while let Ok(message) = socket.recv() {
                 let request = kiapi::common::ApiRequest::decode(message.as_slice()).unwrap();
@@ -4426,7 +4545,7 @@ mod tests {
                     ))
                 } else if message.type_url.ends_with("BeginCommit") {
                     captured.lock().unwrap().begin_count += 1;
-                    before_commit = Some(footprints.clone());
+                    pending.clear();
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::BeginCommitResponse {
                             id: Some(kiapi::common::types::Kiid {
@@ -4444,26 +4563,9 @@ mod tests {
                         .unwrap()
                         .update_batches
                         .push(update.items.len());
-                    if !fail_update && !corrupt_readback {
-                        for updated in &update.items {
-                            let fp = kiapi::board::types::FootprintInstance::decode(
-                                updated.value.as_slice(),
-                            )
-                            .unwrap();
-                            let old = footprints
-                                .iter_mut()
-                                .find(|old| {
-                                    kiapi::board::types::FootprintInstance::decode(
-                                        old.value.as_slice(),
-                                    )
-                                    .unwrap()
-                                    .id == fp.id
-                                })
-                                .unwrap();
-                            *old = updated.clone();
-                        }
+                    if !fail_update {
+                        pending.extend(update.items.iter().cloned());
                     }
-                    captured.lock().unwrap().final_items = footprints.clone();
                     let updated_items = update
                         .items
                         .into_iter()
@@ -4495,10 +4597,35 @@ mod tests {
                     let end = kiapi::common::commands::EndCommit::decode(message.value.as_slice())
                         .unwrap();
                     captured.lock().unwrap().commit_actions.push(end.action());
-                    if end.action() == kiapi::common::commands::CommitAction::CmaDrop {
-                        footprints = before_commit.take().unwrap();
-                        captured.lock().unwrap().final_items = footprints.clone();
+                    if end.action() == kiapi::common::commands::CommitAction::CmaCommit {
+                        for updated in pending.drain(..) {
+                            let mut fp = kiapi::board::types::FootprintInstance::decode(
+                                updated.value.as_slice(),
+                            )
+                            .unwrap();
+                            if pushed_commits < corrupt_commits {
+                                fp.position
+                                    .as_mut()
+                                    .expect("fixture footprints are placed")
+                                    .x_nm += 1_000_000;
+                            }
+                            let old = footprints
+                                .iter_mut()
+                                .find(|old| {
+                                    kiapi::board::types::FootprintInstance::decode(
+                                        old.value.as_slice(),
+                                    )
+                                    .unwrap()
+                                    .id == fp.id
+                                })
+                                .unwrap();
+                            *old = builders::pack_any(&fp, "kiapi.board.types.FootprintInstance");
+                        }
+                        pushed_commits += 1;
+                    } else {
+                        pending.clear();
                     }
+                    captured.lock().unwrap().final_items = footprints.clone();
                     api_reply(builders::pack_any(
                         &kiapi::common::commands::EndCommitResponse {},
                         "kiapi.common.commands.EndCommitResponse",
@@ -4588,11 +4715,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn readback_mismatch_drops_the_commit_and_restores_exact_input() {
+    async fn apply_with_corrupt_commits(
+        corrupt_commits: usize,
+    ) -> (
+        crate::mcp::protocol::CallToolResult,
+        MutationCapture,
+        Vec<prost_types::Any>,
+    ) {
         let (_temp, board, items) = plan_fixture();
         let before = vec![items[2].clone()];
-        let mock = spawn_planner_mock_batch(&board, before.clone(), false, true);
+        let mock = spawn_planner_mock_batch(&board, before.clone(), false, corrupt_commits);
         let context = test_context(&mock.url);
         let dry = handle_update_footprints_from_library(&json!({"board": board}), &context)
             .await
@@ -4607,13 +4739,47 @@ mod tests {
         )
         .await
         .unwrap();
+        let capture = std::mem::take(&mut *mock.capture.lock().unwrap());
+        (result, capture, before)
+    }
+
+    #[tokio::test]
+    async fn readback_mismatch_after_the_commit_restores_the_previous_footprints() {
+        // KiCad shows an update only once its commit is pushed, so the update is verified
+        // after the push and a mismatch is undone by a second, restoring commit.
+        let (result, capture, before) = apply_with_corrupt_commits(1).await;
         assert!(result.is_error);
-        let capture = mock.capture.lock().unwrap();
+        let text = result_text(&result);
+        assert!(text.contains("independent readback differs"), "{text}");
+        assert!(text.contains("rolled back"), "{text}");
         assert_eq!(
             capture.commit_actions,
-            vec![kiapi::common::commands::CommitAction::CmaDrop]
+            vec![
+                kiapi::common::commands::CommitAction::CmaCommit,
+                kiapi::common::commands::CommitAction::CmaCommit
+            ]
         );
-        assert_eq!(capture.final_items, before);
+        assert_eq!(capture.update_batches, vec![1, 1]);
+        assert_eq!(
+            capture.final_items, before,
+            "the board holds the original footprints again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restore_that_cannot_be_confirmed_says_so_and_never_claims_a_rollback() {
+        let (result, capture, before) = apply_with_corrupt_commits(2).await;
+        assert!(result.is_error);
+        let text = result_text(&result);
+        assert!(text.contains("independent readback differs"), "{text}");
+        assert!(text.contains("could not be confirmed"), "{text}");
+        assert!(text.contains("Undo"), "{text}");
+        assert!(!text.contains("rolled back"), "{text}");
+        assert_eq!(capture.commit_actions.len(), 2);
+        assert_ne!(
+            capture.final_items, before,
+            "the mock left a mangled footprint"
+        );
     }
 
     #[tokio::test]

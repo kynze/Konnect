@@ -145,11 +145,11 @@ def run_refresh(binary, py, root, env, socket_path, fixture):
             board=str(board), dry_run=False, expected_plan_revision=revision)))
         text = result["content"][0]["text"]
         if result.get("isError"):
-            # Observed on KiCad 10.0.6: the in-commit readback still shows the footprint as it was
-            # before the commit, so the safety check refuses (see docs/AILAB-48-VERIFICATION.md).
-            # What must hold regardless: a refused apply changes nothing.
-            assert "independent readback differs" in text, text
-            print("apply refused by the in-commit readback check:", text[:420])
+            # A readback mismatch after the commit is undone by a compensating commit
+            # (see docs/AILAB-48-VERIFICATION.md). What must hold regardless: the board is
+            # confirmed back in its original state.
+            assert "independent readback differs" in text and "rolled back" in text, text
+            print("apply failed verification and was rolled back:", text[:420])
             print("save:", server.call_text("save_project", dict())[:120])
             after = native_read()
             assert after == before, (before, after)
