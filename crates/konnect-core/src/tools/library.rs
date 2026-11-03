@@ -16,6 +16,13 @@ use konnect_sexp::writer::{
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+#[path = "library_pad_mask_paste.rs"]
+mod pad_mask_paste;
+
+#[cfg(test)]
+#[path = "library_pad_mask_paste_tests.rs"]
+mod pad_mask_paste_tests;
+
 #[path = "library_symbol_properties.rs"]
 mod symbol_properties;
 
@@ -131,6 +138,18 @@ pub fn tools() -> Vec<ToolDef> {
                                     "minimum": 0,
                                     "maximum": 0.5,
                                     "description": "Rounded-rectangle corner radius ratio (0..0.5)"
+                                },
+                                "solder_mask_margin": {
+                                    "type": ["number", "null"],
+                                    "description": "Pad-local solder-mask margin in mm (|v| <= 10). Omit or null to inherit. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
+                                },
+                                "solder_paste_margin": {
+                                    "type": ["number", "null"],
+                                    "description": "Pad-local absolute solder-paste margin in mm (|v| <= 10). Omit or null to inherit. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
+                                },
+                                "solder_paste_margin_ratio": {
+                                    "type": ["number", "null"],
+                                    "description": "Pad-local solder-paste ratio (-1..1, -0.1 = -10%). Omit or null to inherit. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
                                 }
                             },
                             "required": ["number", "type", "shape", "x", "y", "width", "height"]
@@ -176,6 +195,18 @@ pub fn tools() -> Vec<ToolDef> {
                         "description": "New standard pad shape (optional). roundrect gets a valid default corner ratio when needed."
                     },
                     "drill": { "type": "number", "description": "New drill diameter in mm (optional)" },
+                    "solder_mask_margin": {
+                        "type": ["number", "null"],
+                        "description": "Pad-local solder-mask margin in mm (|v| <= 10). Omit to leave unchanged; null removes the override so the pad inherits. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
+                    },
+                    "solder_paste_margin": {
+                        "type": ["number", "null"],
+                        "description": "Pad-local absolute solder-paste margin in mm (|v| <= 10). Omit to leave unchanged; null restores inheritance. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
+                    },
+                    "solder_paste_margin_ratio": {
+                        "type": ["number", "null"],
+                        "description": "Pad-local solder-paste ratio (-1..1, -0.1 = -10%). Omit to leave unchanged; null restores inheritance. 0 is refused: KiCad 10.0.6 reads a pad-local 0 as unset."
+                    },
                     "zone_connect": {
                         "type": "string",
                         "enum": ["inherited", "solid", "thermal", "none"],
@@ -836,9 +867,13 @@ async fn handle_create_footprint(
             String::new()
         };
 
+        // Validated above; omitted/null writes nothing so the pad inherits.
+        let mask_paste = pad_mask_paste::parse(pad, "", false)
+            .expect("validated")
+            .create_tokens();
         pad_sexp.push_str(&format!(
-            "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {})",
-            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio
+            "\n  (pad \"{}\" {} {} {} (size {} {}) {} {} {}{})",
+            number, pad_type, shape, at, w, h, layers, drill_sexp, roundrect_ratio, mask_paste
         ));
         pad_geoms.push(PadGeom {
             number,
@@ -915,6 +950,10 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                     "missing or not a number",
                 ));
             }
+        }
+        if let Err((field, reason)) = pad_mask_paste::parse(pad, &format!("pads[{index}]."), false)
+        {
+            return Err(invalid_library_argument(&field, reason));
         }
     }
     Ok(())
@@ -999,6 +1038,11 @@ async fn handle_edit_footprint_pad(
         },
     };
 
+    let mask_paste = match pad_mask_paste::parse(args, "", true) {
+        Ok(spec) => spec,
+        Err((field, reason)) => return Ok(invalid_library_argument(&field, reason)),
+    };
+
     let content = read_consistent(&path)?;
     match parse_sexp(&content) {
         Ok(root) if root.head() == Some("footprint") => {}
@@ -1019,6 +1063,7 @@ async fn handle_edit_footprint_pad(
     let mut edits = Vec::new();
     let mut matched_count = 0usize;
     let mut observed_zone_connects = Vec::new();
+    let mut observed_mask_paste: Vec<serde_json::Value> = Vec::new();
     for (start, end) in find_direct_child_blocks(&content, "footprint") {
         let block = &content[start..end];
         let Ok(node) = parse_sexp(block) else {
@@ -1042,6 +1087,20 @@ async fn handle_edit_footprint_pad(
             observed_zone_connects.push(
                 PadZoneConnect::of_pad(&edited).map_or("unrecognized", PadZoneConnect::as_str),
             );
+        }
+        if !mask_paste.is_empty() {
+            edited = pad_mask_paste::apply(edited, &mask_paste);
+            // Verified before the write, so a failure leaves the file as it was.
+            if let Err(reason) = pad_mask_paste::verify(&edited, &mask_paste) {
+                return Ok(CallToolResult::error(format!(
+                    "Pad '{pad_number}' was not written: {reason}"
+                )));
+            }
+            if let Ok(node) = parse_sexp(&edited) {
+                if let Ok(read) = pad_mask_paste::read_pad(&node, &node) {
+                    observed_mask_paste.push(read);
+                }
+            }
         }
         edits.push(SexpEdit::replace(start, end, edited));
         if !match_all {
@@ -1072,6 +1131,14 @@ async fn handle_edit_footprint_pad(
         [] => {}
         [observed] => response["zone_connect"] = json!(observed),
         disagreeing => response["zone_connect"] = json!(disagreeing),
+    }
+    // Pad-local values as read back from the written pads. Inheritance beyond
+    // the pad is not resolved here; get_footprint_info reports it.
+    observed_mask_paste.dedup();
+    match observed_mask_paste.as_slice() {
+        [] => {}
+        [observed] => response["mask_paste"] = observed.clone(),
+        disagreeing => response["mask_paste"] = json!(disagreeing),
     }
 
     Ok(CallToolResult::text(
@@ -4913,6 +4980,7 @@ async fn handle_get_footprint_info(
     });
     if args["include_pads"].as_bool().unwrap_or(false) {
         let mut pads = Vec::with_capacity(pad_count);
+        let mut mask_paste = Vec::with_capacity(pad_count);
         for pad in footprint
             .children()
             .unwrap_or(&[])
@@ -4948,10 +5016,27 @@ async fn handle_get_footprint_info(
                     )))
                 }
             };
+            match pad_mask_paste::read_pad(pad, &footprint) {
+                Ok(read) => mask_paste.push(read),
+                Err(error) => {
+                    return Ok(CallToolResult::error(format!(
+                        "Could not read mask/paste settings of pad '{pad_number}': {error}"
+                    )))
+                }
+            }
             pads.push(info);
         }
         response["coordinate_space"] = json!("footprint_local");
-        response["pads"] = serde_json::to_value(pads)?;
+        let mut pads_json = serde_json::to_value(pads)?;
+        for (pad_json, read) in pads_json
+            .as_array_mut()
+            .into_iter()
+            .flatten()
+            .zip(mask_paste)
+        {
+            pad_json["mask_paste"] = read;
+        }
+        response["pads"] = pads_json;
     }
     let graphics_layer = args["graphics_layer"].as_str();
     let include_graphics =
