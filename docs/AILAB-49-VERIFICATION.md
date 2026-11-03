@@ -49,3 +49,14 @@ Native FootprintLoad on an expanded path proves payload compatibility, not nativ
 Reviewed P1 and empty-export defects are corrected and tested. Remaining validation limit: full broader group has its original environment-dependent 178/1 result, with the failing test passing in isolated C:/tmp; coordinator may rerun the group there if required. Next owner is coordinator/reviewer for final SHA review, integration and release gates. This worker stops at Quality Check and starts no follow-on task.
 
 Build setup used existing Rust/protoc/CMake with CARGO_BUILD_JOBS=2, task-owned CARGO_TARGET_DIR=C:/tmp/konnect-ailab49-target and worktree-local KONNECT_STATE_DIR; no shared target/state or installed configuration was changed. Earlier interrupted build/setup failures are not counted as regression evidence.
+
+## Independent review follow-up (2026-11-03, reviewer read 110edf5; no serious findings)
+
+Changed after review:
+- An empty value configured in `kicad_common.json` is now ignored like an empty export (new unit test `ailab49_empty_configured_value_falls_back_to_the_default_root`); an empty `KICAD_DOCUMENTS_HOME` is ignored too. Whether KiCad itself skips an empty configured value was not checked; the choice keeps the two sources consistent. The new unit test was written after the change and was not observed red.
+- The served harness no longer uses the default root as the "override": configured/exported/empty-configured modes put the library in a separate `Explicit Root` and place a same-name decoy (2 pads) in the default root, so a lookup that ignored the override would now fail (`pad_count == 1` and the exact path are asserted). Re-run: all 7 modes pass, default mode with native 10.0.6 load. Unit tests: 9 passed (8 on non-Windows: the separator test is `cfg(windows)`).
+
+Stated limits the review pointed out, not changed:
+- `KICAD9_3RD_PARTY` / `KICAD8_3RD_PARTY` also get a version-specific default root. KiCad 10.0.6's `InitializeEnvironment` registers only the running version's variable (confirmed in the pinned source), so this is a deliberate Konnect leniency beyond KiCad parity.
+- Linux/macOS branches are source-grounded only. `integration.rs` has its own, separate `KICAD*_3RD_PARTY` handling for freerouting that is not covered here.
+- A stale exported override now yields an unresolved-URI refusal instead of silently using another root (intended; the message names the URI).

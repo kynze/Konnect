@@ -49,7 +49,13 @@ pub(super) fn expand_with(
             // KiCad InitializeEnvironment ignores empty exported values.
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-            .or_else(|| configured.get(var).map(PathBuf::from))
+            // An empty configured value is ignored like an empty export.
+            .or_else(|| {
+                configured
+                    .get(var)
+                    .filter(|value| !value.is_empty())
+                    .map(PathBuf::from)
+            })
             .or_else(|| {
                 documents_dir.map(|dir| {
                     dir.join(KICAD_DOCUMENTS_SUBDIR)
@@ -322,6 +328,25 @@ mod tests {
                 }
             ),
             Some(pretty)
+        );
+    }
+
+    #[test]
+    fn ailab49_empty_configured_value_falls_back_to_the_default_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default = tmp
+            .path()
+            .join(KICAD_DOCUMENTS_SUBDIR)
+            .join("10.0/3rdparty/Parts.pretty");
+        std::fs::create_dir_all(&default).unwrap();
+        assert_eq!(
+            resolve(
+                "${KICAD10_3RD_PARTY}/Parts.pretty",
+                None,
+                Some(Path::new("")),
+                Some(tmp.path())
+            ),
+            Some(default)
         );
     }
 

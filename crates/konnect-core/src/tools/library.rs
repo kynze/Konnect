@@ -1613,6 +1613,8 @@ fn expand_lib_uri(uri: &str, kiprjmod: Option<&Path>) -> Option<PathBuf> {
     #[cfg(not(any(target_os = "windows", target_os = "macos")))]
     let platform_documents_dir = dirs::data_local_dir;
     let documents_dir = std::env::var_os("KICAD_DOCUMENTS_HOME")
+        // An empty value is no value, as for the 3RD_PARTY exports.
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(platform_documents_dir);
     uri_resolver::expand_with(
