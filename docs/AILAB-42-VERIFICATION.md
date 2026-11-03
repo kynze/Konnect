@@ -46,3 +46,18 @@ Scratch config/documents roots, inproc endpoint, scratch library; no IPC, editor
 - `get_component_pads` (board file / IPC) still builds `copper_layers` in `pcb_components.rs` / konnect-ipc by copying header geometry; that code is outside this task's ownership and was not changed.
 - `crates/konnect/assets/skills/kicad-library/SKILL.md` does not yet mention `padstack` or the AILAB-41 fields (unowned; follow-up).
 - Debug build only: `C:/tmp/konnect-ailab42-target/debug/konnect.exe`.
+
+## Independent review follow-up (2026-11-03, reviewer read c25a404; no data-loss or write-before-check bug)
+
+This branch also carries the AILAB-41 review follow-up (cherry-picked as 0c45841; see docs/AILAB-41-VERIFICATION.md).
+
+Fixed after review:
+- Multi-line pads got an over-indented padstack block (layer children five tabs deep instead of four). `render` now passes the padstack's own indent. Negative control: with the old indentation re-introduced, 3 new tests fail; with the fix restored all pass.
+- `layout_of` now takes the indent from the last child that starts on its own line, not from an inline-appended child such as ` (drill 0.9)`.
+- Readback now reports every unmodelled header token (`chamfer_ratio`, `rect_delta`, `primitives`, `options`, `offset`, `chamfer`) in `front.unmodelled`, not just `offset`.
+- Tests added: re-applying the same stack to a KiCad-native pad is byte-identical in LF, CRLF and space-indented forms; a changed layer is written with the file's own indentation (exact expected text); a new stack on a CRLF multi-line pad has the exact expected block and removing it restores the original; `match_all` + `new_number` + `zone_connect` + `drill` + `padstack` on duplicate pad numbers, and first-match-only without `match_all`; header-token readback and refusal.
+- Native script phase 6: a served edit of a pad KiCad itself saved leaves the file byte-identical for an identical stack, and KiCad reads back a changed inner layer.
+
+Counts: `padstack_tests` 16 passed; library group once, isolated TEMP: **210 passed, 0 failed**; native script 6 PASS lines.
+
+Kept as designed (reviewer's finding 3): one pad with an unknown mode, a missing layer or an unreadable size fails the whole `get_footprint_info include_pads` call rather than being skipped, so nothing is silently dropped. A roundrect layer with no ratio token reports no `corner_rounding_ratio` (KiCad applies its own default).

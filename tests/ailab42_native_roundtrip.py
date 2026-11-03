@@ -106,8 +106,8 @@ def run(binary, native_python):
             assert bool(result.get("isError", False)) != ok, result
             return json.loads(result["content"][0]["text"])
 
-        def native(name, out):
-            r = subprocess.run([native_python, "-I", "-c", NATIVE, str(pretty), name, str(out)],
+        def native(name, out, lib=None):
+            r = subprocess.run([native_python, "-I", "-c", NATIVE, str(lib or pretty), name, str(out)],
                                env=env, capture_output=True, text=True, timeout=60)
             assert r.returncode == 0, r.stderr + r.stdout
             return json.loads(r.stdout.strip().splitlines()[-1])
@@ -205,6 +205,29 @@ def run(binary, native_python):
             assert "custom" in json.dumps(refused), refused
             assert native_file.read_bytes() == before
             print("PASS KiCad-authored custom stack read per layer; rewrite refused, bytes unchanged")
+
+            # Phase 6: edit the stack of a pad KiCad itself saved (tab-indented, multi-line).
+            saved_lib = root / "KiCadSaved.pretty"
+            saved_lib.mkdir()
+            kicad_file = saved_lib / "Probe.kicad_mod"
+            kicad_file.write_bytes((root / "Out1.pretty" / "Probe.kicad_mod").read_bytes())
+            original = kicad_file.read_bytes()
+            call("edit_footprint_pad", dict(footprint_path=str(kicad_file), pad_number="1",
+                                            padstack=STACK))
+            assert kicad_file.read_bytes() == original, "identical stack must not change KiCad's file"
+            changed = dict(STACK, inner=layer("oval", 1.4, 1.0))
+            call("edit_footprint_pad", dict(footprint_path=str(kicad_file), pad_number="1",
+                                            padstack=changed))
+            assert kicad_file.read_bytes() != original
+            n = native("Probe", root / "Out6.pretty", lib=saved_lib)
+            for phase in ("before", "after"):
+                p1 = n[phase]["1"]
+                assert p1["mode"] == "front_inner_back", p1
+                assert p1["layers"]["In1.Cu"]["shape"] == "oval", p1
+                assert p1["layers"]["In1.Cu"]["size"] == [1400000, 1000000], p1
+                assert p1["layers"]["F.Cu"]["shape"] == "rect" and p1["mask"] == 75000, p1
+            print("PASS served edit of a KiCad-saved multi-line pad: identical stack leaves the file "
+                  "byte-identical, a changed inner layer is read back by KiCad")
         finally:
             timer.cancel()
             process.stdin.close()
