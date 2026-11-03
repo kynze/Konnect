@@ -170,6 +170,27 @@ def run(binary, native_python):
                            pad_number="3", solder_mask_margin=0), ok=False)
             assert "KiCad 10.0.6" in json.dumps(refused), refused
             print("PASS native drops pad-local 0 on load/save; served edit refuses 0")
+
+            # Phase 5: a footprint-level 0 is dropped natively as well (scratch fixture).
+            fp_zero = root / "FpZero.pretty"
+            fp_zero.mkdir()
+            (fp_zero / "F.kicad_mod").write_text(
+                '(footprint "F" (version 20240108) (layer "F.Cu") (solder_mask_margin 0) '
+                '(solder_paste_margin 0) (solder_paste_margin_ratio 0) '
+                '(pad "1" smd rect (at 0 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask")))')
+            code = ("import pcbnew,sys; fp=pcbnew.FootprintLoad(sys.argv[1],'F'); "
+                    "print(fp.GetLocalSolderMaskMargin(), fp.GetLocalSolderPasteMargin(), "
+                    "fp.GetLocalSolderPasteMarginRatio())")
+            r = subprocess.run([native_python, "-I", "-c", code, str(fp_zero)], env=env,
+                               capture_output=True, text=True, timeout=60)
+            assert r.returncode == 0, r.stderr
+            assert r.stdout.split() == ["None", "None", "None"], r.stdout
+            info = call("get_footprint_info", dict(footprint_path=str(fp_zero / "F.kicad_mod"),
+                                                   include_pads=True))
+            m = info["pads"][0]["mask_paste"]["solder_mask_margin"]
+            assert m["source"] == "unknown" and m["effective"] is None, m
+            assert m["footprint_token_zero"] is True, m
+            print("PASS native drops footprint-level 0 too; served readback reports it as inherited")
         finally:
             timer.cancel()
             process.stdin.close()

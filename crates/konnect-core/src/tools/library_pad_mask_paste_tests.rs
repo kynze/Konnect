@@ -157,12 +157,10 @@ async fn create_writes_exact_nanometre_values_and_inherits_when_omitted() {
 }
 
 #[tokio::test]
-async fn edit_omitted_preserves_zero_overrides_and_null_restores_inheritance() {
+async fn edit_preserves_unrelated_settings_replaces_in_place_and_null_restores_inheritance() {
     let server = server().await;
     let dir = tempfile::tempdir().unwrap();
     let path = make(&server, dir.path()).await;
-    let original = std::fs::read_to_string(&path).unwrap();
-
     // Unrelated edit: mask/paste of pad 1 are untouched.
     let r = call(
         &server,
@@ -237,9 +235,6 @@ async fn edit_omitted_preserves_zero_overrides_and_null_restores_inheritance() {
         got["pads"][2]["mask_paste"]["solder_mask_margin"]["source"],
         "unknown"
     );
-
-    // Setting then clearing on a pad restores the exact bytes it started with.
-    let _ = original;
 }
 
 #[tokio::test]
@@ -457,4 +452,155 @@ async fn an_existing_zero_token_reads_back_as_inherited_like_kicad() {
     assert!(got["pads"][0]["mask_paste"]["solder_paste_margin_ratio"]
         .get("file_token_zero")
         .is_none());
+}
+
+/// Every `(solder_… value)` token in the text, in order.
+fn token_lines(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("(solder_") {
+        let end = rest[start..]
+            .find(')')
+            .map_or(rest.len(), |i| start + i + 1);
+        out.push(rest[start..end].to_string());
+        rest = &rest[end..];
+    }
+    out
+}
+
+#[tokio::test]
+async fn an_unrelated_edit_keeps_every_existing_token_byte_for_byte() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = make(&server, dir.path()).await;
+    let before = std::fs::read_to_string(&path).unwrap();
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"1","x":-1.5}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let after = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(token_lines(&before), token_lines(&after));
+    // Only pad 1's position text changed.
+    assert_eq!(before.replacen("(at -1 0)", "(at -1.5 0)", 1), after);
+}
+
+#[tokio::test]
+async fn a_malformed_token_elsewhere_does_not_block_an_unrelated_setting() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Mixed.kicad_mod");
+    std::fs::write(
+        &path,
+        "(footprint \"Mixed\"
+  (version 20240108)
+  (layer \"F.Cu\")
+  (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (solder_paste_margin foo))
+)",
+    )
+    .unwrap();
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"1","solder_mask_margin":0.05}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("(solder_mask_margin 0.05)"));
+    assert!(text.contains("(solder_paste_margin foo)"), "left as it was");
+}
+
+#[tokio::test]
+async fn setting_replaces_the_first_token_and_collapses_duplicates() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Dup.kicad_mod");
+    std::fs::write(
+        &path,
+        "(footprint \"Dup\"
+  (version 20240108)
+  (layer \"F.Cu\")
+  (pad \"1\" smd rect (at 0 0) (size 1 1) (layers \"F.Cu\" \"F.Mask\") (solder_mask_margin 0.01) (solder_mask_margin 0.02))
+)",
+    )
+    .unwrap();
+    // KiCad keeps the last duplicate, and readback follows it.
+    let got = info(&server, &path).await;
+    assert_eq!(
+        got["pads"][0]["mask_paste"]["solder_mask_margin"]["local"],
+        0.02
+    );
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"1","solder_mask_margin":0.125}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(text.matches("(solder_mask_margin").count(), 1, "{text}");
+    assert!(text.contains("(solder_mask_margin 0.125)"));
+}
+
+#[tokio::test]
+async fn exponent_and_sub_nanometre_input_is_rounded_to_whole_nanometres() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Round.kicad_mod");
+    let r = call(
+        &server,
+        "create_footprint",
+        json!({"output":path,"name":"Round","pads":[
+            {"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":1,"height":1,
+             "solder_mask_margin":7.5e-2,"solder_paste_margin":-1.00000049e-1,
+             "solder_paste_margin_ratio":-5e-2}]}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(text.contains("(solder_mask_margin 0.075)"), "{text}");
+    assert!(text.contains("(solder_paste_margin -0.1)"), "{text}");
+    assert!(text.contains("(solder_paste_margin_ratio -0.05)"), "{text}");
+    assert!(!text.contains("e-0"), "no exponent forms written: {text}");
+}
+
+#[tokio::test]
+async fn edit_response_reports_pad_local_values_without_inventing_effective_ones() {
+    let server = server().await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = make(&server, dir.path()).await;
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":path,"pad_number":"3","solder_mask_margin":0.05}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let mp = &body(&r)["mask_paste"];
+    assert_eq!(mp["solder_mask_margin"]["local"], 0.05);
+    assert!(mp["solder_paste_margin"]["local"].is_null());
+    assert!(mp["solder_mask_margin"].get("effective").is_none(), "{mp}");
+    // match_all over identical pads reports one object, wherever the pads sit.
+    let two = dir.path().join("Two.kicad_mod");
+    let r = call(
+        &server,
+        "create_footprint",
+        json!({"output":two,"name":"Two","pads":[
+            {"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":1,"height":1},
+            {"number":"2","type":"smd","shape":"rect","x":2,"y":0,"width":1,"height":1},
+            {"number":"1","type":"smd","shape":"rect","x":4,"y":0,"width":1,"height":1}]}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    let r = call(
+        &server,
+        "edit_footprint_pad",
+        json!({"footprint_path":two,"pad_number":"1","match_all":true,"solder_mask_margin":0.05}),
+    )
+    .await;
+    assert!(!is_error(&r), "{r}");
+    assert!(body(&r)["mask_paste"].is_object(), "{}", body(&r));
 }

@@ -241,11 +241,30 @@ pub(super) fn read_pad(pad: &SexpNode, footprint: &SexpNode) -> Result<serde_jso
     Ok(serde_json::Value::Object(out))
 }
 
+/// The pad's own values only, for an edit response. Inheritance is not
+/// resolved here (that needs the footprint and board); `get_footprint_info`
+/// reports `source` and `effective`.
+pub(super) fn read_local(pad: &SexpNode) -> Result<serde_json::Value, String> {
+    let mut out = serde_json::Map::new();
+    for (tag, _) in FIELDS {
+        let local = token_value(pad, tag)
+            .map_err(|e| format!("pad: {e}"))?
+            .filter(|v| *v != 0.0);
+        out.insert(tag.to_string(), json!({ "local": local }));
+    }
+    Ok(serde_json::Value::Object(out))
+}
+
 /// Check that a rewritten pad block reads back as `spec` requested, before
 /// anything is written.
 pub(super) fn verify(pad_block: &str, spec: &Spec) -> Result<(), String> {
     let node = parse_sexp(pad_block).map_err(|e| format!("edited pad does not parse: {e}"))?;
     for ((tag, _), change) in FIELDS.iter().zip(&spec.changes) {
+        // Untouched fields are not this edit's business: a malformed token
+        // elsewhere on the pad must not block an unrelated change.
+        if *change == Change::Keep {
+            continue;
+        }
         let observed = token_value(&node, tag)?;
         let ok = match change {
             Change::Keep => true,
