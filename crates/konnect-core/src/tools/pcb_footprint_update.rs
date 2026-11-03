@@ -105,11 +105,14 @@ impl PadOverrides {
                     })
                 }
                 "zone_connect" => {
+                    // KiCad 10's file tokens are its ZONE_CONNECTION values (observed with
+                    // pcbnew 10.0.6): 0 none, 1 thermal, 2 solid/full, 3 thermal for
+                    // plated-through holes. "Inherited" is the absent token, never a number.
                     settings.zone = Some(match value {
-                        0.0 => kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32,
-                        1.0 => kiapi::board::types::ZoneConnectionStyle::ZcsNone as i32,
-                        2.0 => kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32,
-                        3.0 => kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32,
+                        0.0 => kiapi::board::types::ZoneConnectionStyle::ZcsNone as i32,
+                        1.0 => kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32,
+                        2.0 => kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32,
+                        3.0 => kiapi::board::types::ZoneConnectionStyle::ZcsPthThermal as i32,
                         _ => bail!("pad clause 'zone_connect' must be an integer from 0 to 3"),
                     })
                 }
@@ -498,14 +501,15 @@ fn verify_updated_items(
                 id.value
             );
         };
-        let mut expected_instance = expected.clone();
-        let mut actual_instance = (*actual).clone();
-        expected_instance.definition = None;
-        actual_instance.definition = None;
-        if expected_instance != actual_instance || !changed_domains(&expected, actual)?.is_empty() {
+        let differing_domains = changed_domains(&expected, actual)?;
+        let instance_differs = !instance_state_matches(&expected, actual);
+        if instance_differs || !differing_domains.is_empty() {
             bail!(
-                "independent readback differs for footprint {}; native transaction must be dropped",
-                field_text(&expected.reference_field)
+                "independent readback differs for footprint {} (instance state differs: {}; library-owned domains differing: {:?}; first difference: {}); native transaction must be dropped",
+                field_text(&expected.reference_field),
+                instance_differs,
+                differing_domains,
+                readback_difference_summary(&expected, actual)
             );
         }
         let nets = |fp: &kiapi::board::types::FootprintInstance| -> Result<Vec<(String, Vec<u8>)>> {
@@ -2137,6 +2141,154 @@ fn is_side_specific_layer(layer: i32) -> bool {
     )
 }
 
+/// The placed-instance state that a refresh must leave as KiCad reports it: everything
+/// except the library-owned definition. KiCad reports an unset mounting style as
+/// `FmsUnspecified` after an update where the pre-update state carried `FmsUnknown`;
+/// both mean "not set" (as in `library_owned_attributes`), so they are compared as one.
+fn comparable_instance(
+    instance: &kiapi::board::types::FootprintInstance,
+) -> kiapi::board::types::FootprintInstance {
+    use kiapi::board::types::FootprintMountingStyle as Style;
+    let mut copy = instance.clone();
+    copy.definition = None;
+    if let Some(attributes) = copy.attributes.as_mut() {
+        if attributes.mounting_style == Style::FmsUnknown as i32 {
+            attributes.mounting_style = Style::FmsUnspecified as i32;
+        }
+    }
+    copy
+}
+
+fn instance_state_matches(
+    expected: &kiapi::board::types::FootprintInstance,
+    actual: &kiapi::board::types::FootprintInstance,
+) -> bool {
+    comparable_instance(expected) == comparable_instance(actual)
+}
+
+/// First point at which two readbacks differ, as short `Debug` excerpts, so a refused
+/// transaction says what KiCad stored differently instead of only that something differs.
+fn readback_difference_summary(
+    expected: &kiapi::board::types::FootprintInstance,
+    actual: &kiapi::board::types::FootprintInstance,
+) -> String {
+    fn excerpt(expected: &str, actual: &str) -> String {
+        let e: Vec<char> = expected.chars().collect();
+        let a: Vec<char> = actual.chars().collect();
+        let at = e.iter().zip(&a).take_while(|(x, y)| x == y).count();
+        let start = at.saturating_sub(60);
+        let take = |chars: &[char]| chars.iter().skip(start).take(220).collect::<String>();
+        format!("expected `{}` / actual `{}`", take(&e), take(&a))
+    }
+    if !instance_state_matches(expected, actual) {
+        let (e, a) = (comparable_instance(expected), comparable_instance(actual));
+        return format!(
+            "instance: {}",
+            excerpt(&format!("{e:?}"), &format!("{a:?}"))
+        );
+    }
+    let pads = |fp: &kiapi::board::types::FootprintInstance| {
+        fp.definition
+            .as_ref()
+            .and_then(|definition| normalized_items(definition, "Pad").ok())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|bytes| kiapi::board::types::Pad::decode(bytes.as_slice()).ok())
+            .collect::<Vec<_>>()
+    };
+    let (expected_pads, actual_pads) = (pads(expected), pads(actual));
+    for (index, (e, a)) in expected_pads.iter().zip(&actual_pads).enumerate() {
+        if e != a {
+            return format!("pad #{index}: {}", pad_field_differences(e, a).join("; "));
+        }
+    }
+    format!(
+        "pad count expected {} / actual {}",
+        expected_pads.len(),
+        actual_pads.len()
+    )
+}
+
+/// Every differing top-level pad / padstack field, with short values.
+fn pad_field_differences(
+    expected: &kiapi::board::types::Pad,
+    actual: &kiapi::board::types::Pad,
+) -> Vec<String> {
+    fn short(value: &impl std::fmt::Debug) -> String {
+        let text = format!("{value:?}");
+        if text.chars().count() > 160 {
+            format!("{}...", text.chars().take(160).collect::<String>())
+        } else {
+            text
+        }
+    }
+    let mut out = Vec::new();
+    macro_rules! compare {
+        ($e:expr, $a:expr, $name:expr) => {
+            if $e != $a {
+                out.push(format!(
+                    "{}: expected {} / actual {}",
+                    $name,
+                    short(&$e),
+                    short(&$a)
+                ));
+            }
+        };
+    }
+    compare!(expected.locked, actual.locked, "locked");
+    compare!(expected.number, actual.number, "number");
+    compare!(expected.r#type, actual.r#type, "type");
+    compare!(expected.position, actual.position, "position");
+    compare!(
+        expected.copper_clearance_override,
+        actual.copper_clearance_override,
+        "copper_clearance_override"
+    );
+    match (&expected.pad_stack, &actual.pad_stack) {
+        (Some(e), Some(a)) => {
+            compare!(e.r#type, a.r#type, "stack.type");
+            compare!(e.layers, a.layers, "stack.layers");
+            compare!(e.drill, a.drill, "stack.drill");
+            compare!(
+                e.unconnected_layer_removal,
+                a.unconnected_layer_removal,
+                "stack.unconnected_layer_removal"
+            );
+            compare!(e.copper_layers, a.copper_layers, "stack.copper_layers");
+            compare!(e.angle, a.angle, "stack.angle");
+            compare!(
+                e.front_outer_layers,
+                a.front_outer_layers,
+                "stack.front_outer_layers"
+            );
+            compare!(
+                e.back_outer_layers,
+                a.back_outer_layers,
+                "stack.back_outer_layers"
+            );
+            compare!(e.zone_settings, a.zone_settings, "stack.zone_settings");
+            compare!(
+                e.secondary_drill,
+                a.secondary_drill,
+                "stack.secondary_drill"
+            );
+            compare!(e.tertiary_drill, a.tertiary_drill, "stack.tertiary_drill");
+            compare!(
+                e.front_post_machining,
+                a.front_post_machining,
+                "stack.front_post_machining"
+            );
+            compare!(
+                e.back_post_machining,
+                a.back_post_machining,
+                "stack.back_post_machining"
+            );
+        }
+        (e, a) => compare!(e.is_some(), a.is_some(), "stack present"),
+    }
+    out
+}
+
 fn changed_domains(
     current: &kiapi::board::types::FootprintInstance,
     updated: &kiapi::board::types::FootprintInstance,
@@ -2203,16 +2355,40 @@ fn normalized_items(
                 pad.pad_to_die_delay = None;
                 if let Some(stack) = pad.pad_stack.as_mut() {
                     stack.layers.sort_unstable();
+                    // A drill without a diameter is no hole, whatever layers it names: KiCad
+                    // 10.0.6 reports an SMD pad's absent drill as a 0 x 0 drill from F.Cu
+                    // to B.Cu, where the state read before the update carries none.
                     if stack.drill.as_ref().is_some_and(|drill| {
-                        drill.start_layer == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill.end_layer
-                                == kiapi::board::types::BoardLayer::BlUndefined as i32
-                            && drill
-                                .diameter
-                                .as_ref()
-                                .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
+                        drill
+                            .diameter
+                            .as_ref()
+                            .is_none_or(|diameter| diameter.x_nm == 0 && diameter.y_nm == 0)
                     }) {
                         stack.drill = None;
+                    }
+                    // Parameters that do not apply to a layer's shape (documented as such in
+                    // the API) are KiCad's own defaults when read back: 0.25 / 0.2 corner and
+                    // chamfer ratios and a circle anchor on a plain rectangle. They carry no
+                    // meaning, so they are compared as one value.
+                    for layer in stack.copper_layers.iter_mut() {
+                        use kiapi::board::types::PadStackShape as Shape;
+                        let shape = layer.shape;
+                        if shape != Shape::PssRoundrect as i32
+                            && shape != Shape::PssChamferedrect as i32
+                        {
+                            layer.corner_rounding_ratio = 0.0;
+                        }
+                        if shape != Shape::PssChamferedrect as i32 {
+                            layer.chamfer_ratio = 0.0;
+                            layer.chamfered_corners = None;
+                        }
+                        if shape != Shape::PssCustom as i32 {
+                            layer.custom_anchor_shape = Shape::PssUnknown as i32;
+                            layer.custom_shapes.clear();
+                        }
+                        if shape != Shape::PssTrapezoid as i32 {
+                            layer.trapezoid_delta = None;
+                        }
                     }
                     if stack.zone_settings.as_ref().is_some_and(|settings| {
                         settings.zone_connection
@@ -2397,6 +2573,189 @@ fn field_text(field: &Option<kiapi::board::types::Field>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ailab48_zone_connect_tokens_map_to_kicads_own_meaning() {
+        use kiapi::board::types::ZoneConnectionStyle as Style;
+        // Verified natively: KiCad 10.0.6 reads token 2 as FULL and its saved board
+        // reported THERMAL after the previous (shifted) mapping was applied.
+        for (token, expected) in [
+            (0, Style::ZcsNone),
+            (1, Style::ZcsThermal),
+            (2, Style::ZcsFull),
+            (3, Style::ZcsPthThermal),
+        ] {
+            let pad = konnect_sexp::parse_sexp(&format!("(pad 1 smd rect (zone_connect {token}))"))
+                .unwrap();
+            let parsed = PadOverrides::parse(&pad).unwrap();
+            assert_eq!(parsed.zone, Some(expected as i32), "token {token}");
+        }
+        let absent =
+            PadOverrides::parse(&konnect_sexp::parse_sexp("(pad 1 smd rect)").unwrap()).unwrap();
+        assert_eq!(
+            absent.zone, None,
+            "no token means inherited: nothing is overridden"
+        );
+    }
+
+    #[test]
+    fn ailab48_shape_irrelevant_pad_parameters_do_not_count_as_a_difference() {
+        use kiapi::board::types::{
+            BoardLayer, Footprint, Pad, PadStack, PadStackLayer, PadStackShape, PadType,
+        };
+        use kiapi::common::types::Vector2;
+        use prost::Message;
+        let definition =
+            |shape: PadStackShape, corner: f64, chamfer: f64, anchor: PadStackShape| {
+                let layer = PadStackLayer {
+                    layer: BoardLayer::BlFCu as i32,
+                    shape: shape as i32,
+                    size: Some(Vector2 {
+                        x_nm: 1_000_000,
+                        y_nm: 1_200_000,
+                    }),
+                    corner_rounding_ratio: corner,
+                    chamfer_ratio: chamfer,
+                    custom_anchor_shape: anchor as i32,
+                    ..Default::default()
+                };
+                let pad = Pad {
+                    r#type: PadType::PtSmd as i32,
+                    pad_stack: Some(PadStack {
+                        copper_layers: vec![layer],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                Footprint {
+                    items: vec![prost_types::Any {
+                        type_url: "type.googleapis.com/kiapi.board.types.Pad".into(),
+                        value: pad.encode_to_vec(),
+                    }],
+                    ..Default::default()
+                }
+            };
+        let pads = |d: &Footprint| super::normalized_items(d, "Pad").unwrap();
+        // Observed natively on KiCad 10.0.6: a plain rectangle reads back with 0.25 / 0.2 / circle.
+        let rect_expected = definition(
+            PadStackShape::PssRectangle,
+            0.0,
+            0.0,
+            PadStackShape::PssRectangle,
+        );
+        let rect_native = definition(
+            PadStackShape::PssRectangle,
+            0.25,
+            0.2,
+            PadStackShape::PssCircle,
+        );
+        assert_eq!(pads(&rect_expected), pads(&rect_native));
+        // Where the parameter applies, a different value is a real difference.
+        let round_a = definition(
+            PadStackShape::PssRoundrect,
+            0.25,
+            0.0,
+            PadStackShape::PssRectangle,
+        );
+        let round_b = definition(
+            PadStackShape::PssRoundrect,
+            0.1,
+            0.0,
+            PadStackShape::PssRectangle,
+        );
+        assert_ne!(pads(&round_a), pads(&round_b));
+        let chamfer_a = definition(
+            PadStackShape::PssChamferedrect,
+            0.1,
+            0.2,
+            PadStackShape::PssRectangle,
+        );
+        let chamfer_b = definition(
+            PadStackShape::PssChamferedrect,
+            0.1,
+            0.3,
+            PadStackShape::PssRectangle,
+        );
+        assert_ne!(pads(&chamfer_a), pads(&chamfer_b));
+        // A different shape is still a difference.
+        assert_ne!(pads(&rect_expected), pads(&round_a));
+    }
+
+    #[test]
+    fn ailab48_zero_diameter_drill_is_no_drill_in_pad_comparison() {
+        use kiapi::board::types::{BoardLayer, DrillProperties, Footprint, Pad, PadStack, PadType};
+        use kiapi::common::types::Vector2;
+        use prost::Message;
+        let definition = |drill: Option<DrillProperties>| {
+            let pad = Pad {
+                r#type: PadType::PtSmd as i32,
+                pad_stack: Some(PadStack {
+                    drill,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            Footprint {
+                items: vec![prost_types::Any {
+                    type_url: "type.googleapis.com/kiapi.board.types.Pad".into(),
+                    value: pad.encode_to_vec(),
+                }],
+                ..Default::default()
+            }
+        };
+        let drill = |diameter: i64| DrillProperties {
+            start_layer: BoardLayer::BlFCu as i32,
+            end_layer: BoardLayer::BlBCu as i32,
+            diameter: Some(Vector2 {
+                x_nm: diameter,
+                y_nm: diameter,
+            }),
+            ..Default::default()
+        };
+        // Native KiCad: absent drill is reported as a 0 x 0 drill from F.Cu to B.Cu.
+        assert_eq!(
+            super::normalized_items(&definition(None), "Pad").unwrap(),
+            super::normalized_items(&definition(Some(drill(0))), "Pad").unwrap()
+        );
+        // A real hole, or a different hole, is still a difference.
+        assert_ne!(
+            super::normalized_items(&definition(None), "Pad").unwrap(),
+            super::normalized_items(&definition(Some(drill(800_000))), "Pad").unwrap()
+        );
+        assert_ne!(
+            super::normalized_items(&definition(Some(drill(800_000))), "Pad").unwrap(),
+            super::normalized_items(&definition(Some(drill(900_000))), "Pad").unwrap()
+        );
+    }
+
+    #[test]
+    fn ailab48_unset_mounting_style_is_not_a_readback_difference() {
+        use kiapi::board::types::{FootprintAttributes, FootprintInstance, FootprintMountingStyle};
+        // Observed natively on KiCad 10.0.6: after an update the instance reports
+        // FmsUnspecified where the state read before it carried FmsUnknown.
+        let with_style = |style: FootprintMountingStyle, locked: bool| FootprintInstance {
+            attributes: Some(FootprintAttributes {
+                mounting_style: style as i32,
+                ..Default::default()
+            }),
+            locked: if locked {
+                kiapi::common::types::LockedState::LsLocked as i32
+            } else {
+                kiapi::common::types::LockedState::LsUnlocked as i32
+            },
+            ..Default::default()
+        };
+        let unknown = with_style(FootprintMountingStyle::FmsUnknown, false);
+        let unspecified = with_style(FootprintMountingStyle::FmsUnspecified, false);
+        assert!(super::instance_state_matches(&unknown, &unspecified));
+        // A real mounting-style change, or any other instance state change, still differs.
+        let smd = with_style(FootprintMountingStyle::FmsSmd, false);
+        assert!(!super::instance_state_matches(&unknown, &smd));
+        let locked = with_style(FootprintMountingStyle::FmsUnknown, true);
+        assert!(!super::instance_state_matches(&unknown, &locked));
+        let summary = super::readback_difference_summary(&unknown, &locked);
+        assert!(summary.starts_with("instance:"), "{summary}");
+    }
+
     use super::*;
     use konnect_ipc::builders;
     use konnect_ipc::gen::kiapi;
@@ -3253,7 +3612,8 @@ mod tests {
                 let zone = stack.zone_settings.unwrap();
                 assert_eq!(
                     zone.zone_connection,
-                    kiapi::board::types::ZoneConnectionStyle::ZcsThermal as i32
+                    kiapi::board::types::ZoneConnectionStyle::ZcsFull as i32,
+                    "(zone_connect 2) is KiCad's solid/full connection"
                 );
                 let thermal = zone.thermal_spokes.unwrap();
                 assert_eq!(thermal.width.unwrap().value_nm, 300_000);
@@ -3294,7 +3654,8 @@ mod tests {
         assert_eq!(zero.die_length.unwrap().value_nm, 0);
         assert_eq!(
             zero.zone,
-            Some(kiapi::board::types::ZoneConnectionStyle::ZcsInherited as i32)
+            Some(kiapi::board::types::ZoneConnectionStyle::ZcsNone as i32),
+            "(zone_connect 0) is KiCad's 'none', not inherited"
         );
     }
 
