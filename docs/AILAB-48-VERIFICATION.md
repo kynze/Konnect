@@ -1,4 +1,4 @@
-# AILAB-48 verification
+﻿# AILAB-48 verification
 
 ## Current checkpoint
 
@@ -44,7 +44,7 @@ Final local checks: owned changes reviewed; `git diff --check` passed. No final 
 
 Harness: `tests/ailab48_native_fixture.py` (native pcbnew builds the library footprint and the board), `tests/ailab48_native_refresh.py` (orchestration), `tests/ailab48_hidden_process.py`. Everything runs in a scratch tree: APPDATA / KICAD_CONFIG_HOME / KICAD_DOCUMENTS_HOME / TEMP / TMP under the scratch root (asserted), the server is given the scratch socket explicitly, no other KiCad was running, the editor is terminated by PID, and the library is registered through the Konnect server. KiCad has no headless mode for the IPC API, so the editor runs on a private, never-displayed Windows desktop (the "KiCad Setup" first-run dialog, which also makes the API answer `AS_NOT_READY`, is avoided by seeding the scratch config: global symbol/design-block tables, `first_run_shown`, prompt dismissals). Fixture: SMD pad with local mask +0.075, paste -0.05 mm, paste ratio -0.1, clearance 0.12, zone connection full, thermal gap 0.25, spoke angle 45, die length 0.1 on a footprint placed at (20, 15) mm rotated 90 deg with a net on the pad; the placed copy is stale. Not in the fixture: thermal spoke width (this SWIG binding rejects the optional-int setter).
 
-Defects found only by running against the real editor, now fixed with unit tests (43 module tests pass):
+Defects found only by running against the real editor, now fixed with unit tests (44 module tests pass):
 1. `zone_connect` mapping was shifted: file token 0/1/2/3 was mapped to inherited/none/thermal/full. KiCad's tokens are 0 none, 1 thermal, 2 full, 3 plated-through-hole thermal, inherited = absent. Native evidence: library full came back as thermal.
 2. The readback compared instance state exactly; KiCad reports an unset mounting style as `FmsUnspecified` where the earlier state carried `FmsUnknown` (both mean unset; `library_owned_attributes` already treated them alike).
 3. An SMD pad's absent drill is read back as a 0 x 0 drill from F.Cu to B.Cu; only a layer-less zero drill was treated as no drill.
@@ -54,9 +54,20 @@ Defects found only by running against the real editor, now fixed with unit tests
 Native results:
 - Dry run against the live editor plans exactly one change (U1, domain pads) and marks position, rotation, KIID, layer, locked state, pad nets, symbol path and instance overrides as preserved.
 - A stale plan revision answers `status: conflict` / `stale_plan_revision` with nothing applied.
-- **Apply is refused on KiCad 10.0.6 by the in-commit independent readback.** After `UpdateItems` inside the commit, `GetItems` still returns the footprint as it was before the update (stale pad in footprint-local coordinates: position 0,0, angle 0, no mask/paste/clearance/zone overrides), so the check sees a difference and drops the commit. The board file and the editor board are unchanged afterwards (native reopen of the saved board equals the pre-apply state), and the plan stays plannable (harness PASS lines).
-- Ground-truth experiment (temporary, uncommitted, removed): with the two readback checks bypassed the same apply was accepted, and the saved board reopened natively showed mask 75000, paste -50000, ratio -0.1, clearance 120000, zone full(2), thermal gap 250000, spoke angle 45, die length 100000 nm, net SIG1 and unchanged position, orientation 90 and side; a second dry run was `noop`. So the update itself works once the zone mapping is right; what does not work natively is the check that is supposed to prove it before the commit ends.
+- **Apply, as first designed, was refused on KiCad 10.0.6.** After `UpdateItems` inside the commit, `GetItems` still returned the footprint as it was before the update (stale pad in footprint-local coordinates), so a check taken before the commit was pushed always saw a difference. Ground-truth experiment (temporary, removed): with the checks bypassed the apply was accepted and the saved board reopened natively with every library setting present (mask 75000, paste -50000, ratio -0.1, clearance 120000, zone full(2), thermal gap 250000, spoke angle 45, die length 100000 nm), net SIG1 and unchanged position, orientation 90 and side.
 
-Open decision (not taken here): the in-commit readback cannot verify a footprint update on KiCad 10.0.6 because the replacement is not visible until the commit is pushed. Options: verify after the commit and report an unverified/diverged outcome truthfully (KiCad's undo is the recovery; there is no IPC undo), keep refusing (the feature is then unusable natively), or find a readback that sees pending changes. The "atomic apply with independent readback before publishing" claim in this report's earlier sections is therefore not true on native KiCad 10.0.6 and should not be relied on.
+## Decision (user, 2026-11-03): verify after the commit, undo with a compensating commit
 
-Still not verified: native undo (the Konnect client has no undo call), the 72-footprint / 66-rejection analogue and 57-model bulk scenario natively, back-side transforms natively, spoke width, and deferred swaps/bulk (unchanged: DEFERRED.patch).
+KiCad's IPC API has no undo, and a dropped commit cannot be verified because its changes are invisible until it is pushed. So `update_footprints_from_library` now works in two commits, which keeps "an apply either verifiably happened or verifiably did not":
+1. Commit 1 ("Update footprints from libraries"): final stale-plan check, capture of the live footprints about to be replaced, `UpdateItems`, push.
+2. Readback of the published state against the plan (same comparison as before: library-owned domains, instance state, pad nets by name). Match: status `applied`.
+3. Mismatch: commit 2 ("Restore footprints after a failed library update") puts the captured footprints back, and a second readback must match them. The call fails with the difference and says `rolled back, nothing was applied` only when that readback confirms it. If the restore cannot be confirmed, or the first readback itself failed, the message says the board may be partly updated or unverified, not to save it, and to use Edit > Undo in KiCad (restore, then update) or close without saving. A failure before the push still drops the commit as before.
+
+Cost: a failed verification leaves two entries in KiCad's undo history (update, restore) whose net effect is nil; the board file is never touched by Konnect (save stays an explicit step). The restore is only as faithful as the footprint message KiCad returns; it is checked by the same readback, never assumed.
+
+Native evidence, KiCad 10.0.6, hidden-desktop scratch editor (`tests/ailab48_native_refresh.py`):
+- Rollback, observed for real: one run reported a pad-net difference (KiCad's readback omits the internal net code, which the comparison now ignores; the net name matched). The call answered `rolled back, nothing was applied`; the saved board reopened natively equal to the pre-apply state and a new dry run still planned the same change.
+- After that fix: apply reports `applied` (1 changed), the saved board reopens with all library pad settings above, net SIG1, position (20, 15) mm, orientation 90, side front unchanged, and a second dry run is a no-op.
+- The harness does not force a divergence, so the rollback path is covered permanently by unit tests only (mock that, like KiCad, shows updates only after the push): `readback_mismatch_after_the_commit_restores_the_previous_footprints` (two commits, original footprints back, "rolled back") and `a_restore_that_cannot_be_confirmed_says_so_and_never_claims_a_rollback` (no "rolled back", points to Undo). 44 module tests pass.
+
+Still not verified: the 72-footprint / 66-rejection analogue and 57-model bulk scenario natively, back-side transforms natively, spoke width, and deferred swaps/bulk (unchanged: DEFERRED.patch).
