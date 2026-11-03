@@ -17,6 +17,10 @@ def run(binary, native_python, root_source):
         third_party = documents / kicad_dir / "10.0/3rdparty"
         pretty = third_party / "footprints/Vendor Parts.pretty"
         pretty.mkdir(parents=True)
+        # An explicit override lives in its own root, so a result from the default
+        # root (a decoy with a different pad count) is distinguishable from it.
+        explicit = root / "Explicit Root"
+        explicit_pretty = explicit / "footprints/Vendor Parts.pretty"
         env = os.environ.copy()
         env.update(APPDATA=str(root / "config"), HOME=str(root),
                    KICAD_CONFIG_HOME=str(root / "native-config"),
@@ -24,7 +28,12 @@ def run(binary, native_python, root_source):
         env.pop("KICAD10_3RD_PARTY", None)
         if root_source.startswith("empty-"):
             env["KICAD10_3RD_PARTY"] = ""
-        override = root / "missing override" if root_source.startswith("missing-") else third_party
+        explicit_source = root_source in ("configured", "exported", "empty-configured")
+        override = (root / "missing override" if root_source.startswith("missing-")
+                    else explicit if explicit_source else third_party)
+        expected = explicit_pretty if explicit_source else pretty
+        if explicit_source:
+            explicit_pretty.mkdir(parents=True)
         if root_source.endswith("exported"):
             env["KICAD10_3RD_PARTY"] = str(override)
         elif root_source.endswith("configured"):
@@ -69,8 +78,14 @@ def run(binary, native_python, root_source):
             process.stdin.write(json.dumps(dict(jsonrpc="2.0", method="notifications/initialized")) + "\n")
             process.stdin.flush()
             call("load_toolset", dict(name="library"))
-            call("create_footprint", dict(output=str(pretty / "Probe.kicad_mod"), name="Probe",
-                 pads=[dict(number="1", type="smd", shape="rect", x=0, y=0, width=1, height=1)]))
+            one_pad = [dict(number="1", type="smd", shape="rect", x=0, y=0, width=1, height=1)]
+            call("create_footprint", dict(output=str(expected / "Probe.kicad_mod"), name="Probe",
+                 pads=one_pad))
+            if explicit_source:
+                decoy = one_pad + [dict(number="2", type="smd", shape="rect", x=2, y=0,
+                                        width=1, height=1)]
+                call("create_footprint", dict(output=str(pretty / "Probe.kicad_mod"),
+                                              name="Probe", pads=decoy))
             call("register_footprint_library", dict(
                 library_path="${KICAD10_3RD_PARTY}/footprints/Vendor Parts.pretty",
                 nickname="AILAB49", scope="global"))
@@ -80,7 +95,7 @@ def run(binary, native_python, root_source):
                 print(f"PASS served {root_source} refuses existing default same-name library")
             else:
                 found = call("get_footprint_info", dict(footprint_path="AILAB49:Probe"))
-                assert found["pad_count"] == 1 and Path(found["path"]) == pretty / "Probe.kicad_mod", found
+                assert found["pad_count"] == 1 and Path(found["path"]) == expected / "Probe.kicad_mod", found
                 print(f"PASS served {root_source} third-party lookup with spaces; pad_count=1")
             call("register_footprint_library", dict(library_path="${AILAB49_UNKNOWN}/Missing.pretty",
                                                     nickname="AILAB49Missing", scope="global"))
@@ -97,7 +112,7 @@ def run(binary, native_python, root_source):
                 code = ("import pcbnew,sys; fp=pcbnew.FootprintLoad(sys.argv[1], 'Probe'); "
                         "assert fp is not None and len(list(fp.Pads())) == 1; "
                         "print('PASS native '+pcbnew.Version()+' same footprint; pad_count=1')")
-                result = subprocess.run([native_python, "-c", code, str(pretty)], env=env,
+                result = subprocess.run([native_python, "-c", code, str(expected)], env=env,
                                         capture_output=True, text=True, timeout=30)
                 assert result.returncode == 0, result.stderr
                 print(result.stdout.strip())
