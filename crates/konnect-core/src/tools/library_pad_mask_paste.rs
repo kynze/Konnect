@@ -22,11 +22,17 @@ pub(super) enum Kind {
 }
 
 /// KiCad's writer order for these three tokens.
-pub(super) const FIELDS: [(&str, Kind); 3] = [
-    ("solder_mask_margin", Kind::Margin),
-    ("solder_paste_margin", Kind::Margin),
-    ("solder_paste_margin_ratio", Kind::Ratio),
-];
+///
+/// A function rather than a `const` so the field names sit in a function body that the
+/// schema-parameter-usage guard can reach from the registered handler. That guard also skips a
+/// function whose signature contains a semicolon, hence a `Vec` and not a fixed-size array.
+pub(super) fn field_table() -> Vec<(&'static str, Kind)> {
+    vec![
+        ("solder_mask_margin", Kind::Margin),
+        ("solder_paste_margin", Kind::Margin),
+        ("solder_paste_margin_ratio", Kind::Ratio),
+    ]
+}
 
 /// Tokens KiCad writes after the mask/paste group; a new token goes before
 /// the first of these that exists.
@@ -65,7 +71,7 @@ impl Spec {
     /// Text of the tokens to append when creating a pad (omitted/null: none).
     pub(super) fn create_tokens(&self) -> String {
         let mut out = String::new();
-        for ((tag, _), change) in FIELDS.iter().zip(&self.changes) {
+        for ((tag, _), change) in field_table().iter().zip(&self.changes) {
             if let Change::Set(text) = change {
                 out.push_str(&format!(" ({tag} {text})"));
             }
@@ -123,13 +129,13 @@ fn parse_one(value: &serde_json::Value, kind: Kind, allow_clear: bool) -> Result
 
 /// Read the three fields from a create pad object or an edit argument object.
 /// `prefix` names the object in refusals (`pads[2].` or empty).
-pub(super) fn parse(
+pub(super) fn parse_spec(
     object: &serde_json::Value,
     prefix: &str,
     allow_clear: bool,
 ) -> Result<Spec, (String, String)> {
     let mut changes = [Change::Keep, Change::Keep, Change::Keep];
-    for (slot, (tag, kind)) in changes.iter_mut().zip(FIELDS) {
+    for (slot, (tag, kind)) in changes.iter_mut().zip(field_table()) {
         if let Some(value) = object.get(tag) {
             *slot = parse_one(value, kind, allow_clear)
                 .map_err(|reason| (format!("{prefix}{tag}"), reason))?;
@@ -148,7 +154,7 @@ fn token_ranges(pad_block: &str, tag: &str) -> Vec<(usize, usize)> {
 
 /// Apply `spec` to one pad block. Untouched fields keep their exact bytes.
 pub(super) fn apply(mut pad_block: String, spec: &Spec) -> String {
-    for (index, ((tag, _), change)) in FIELDS.iter().zip(&spec.changes).enumerate() {
+    for (index, ((tag, _), change)) in field_table().iter().zip(&spec.changes).enumerate() {
         if *change == Change::Keep {
             continue;
         }
@@ -162,7 +168,7 @@ pub(super) fn apply(mut pad_block: String, spec: &Spec) -> String {
                 }
             }
             (Change::Set(text), None) => {
-                let later: Vec<&str> = FIELDS[index + 1..]
+                let later: Vec<&str> = field_table()[index + 1..]
                     .iter()
                     .map(|(t, _)| *t)
                     .chain(AFTER_GROUP.iter().copied())
@@ -215,7 +221,7 @@ fn token_value(node: &SexpNode, tag: &str) -> Result<Option<f64>, String> {
 /// and flagged (`file_token_zero` / `footprint_token_zero`).
 pub(super) fn read_pad(pad: &SexpNode, footprint: &SexpNode) -> Result<serde_json::Value, String> {
     let mut out = serde_json::Map::new();
-    for (tag, _) in FIELDS {
+    for (tag, _) in field_table() {
         let raw_local = token_value(pad, tag).map_err(|e| format!("pad: {e}"))?;
         let raw_inherited = token_value(footprint, tag).map_err(|e| format!("footprint: {e}"))?;
         let local = raw_local.filter(|v| *v != 0.0);
@@ -246,7 +252,7 @@ pub(super) fn read_pad(pad: &SexpNode, footprint: &SexpNode) -> Result<serde_jso
 /// reports `source` and `effective`.
 pub(super) fn read_local(pad: &SexpNode) -> Result<serde_json::Value, String> {
     let mut out = serde_json::Map::new();
-    for (tag, _) in FIELDS {
+    for (tag, _) in field_table() {
         let local = token_value(pad, tag)
             .map_err(|e| format!("pad: {e}"))?
             .filter(|v| *v != 0.0);
@@ -259,7 +265,7 @@ pub(super) fn read_local(pad: &SexpNode) -> Result<serde_json::Value, String> {
 /// anything is written.
 pub(super) fn verify(pad_block: &str, spec: &Spec) -> Result<(), String> {
     let node = parse_sexp(pad_block).map_err(|e| format!("edited pad does not parse: {e}"))?;
-    for ((tag, _), change) in FIELDS.iter().zip(&spec.changes) {
+    for ((tag, _), change) in field_table().iter().zip(&spec.changes) {
         // Untouched fields are not this edit's business: a malformed token
         // elsewhere on the pad must not block an unrelated change.
         if *change == Change::Keep {
