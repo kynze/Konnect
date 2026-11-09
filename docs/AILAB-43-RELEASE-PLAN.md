@@ -1,6 +1,6 @@
 # AILAB-43 release plan (draft, 2026-11-09)
 
-Status: integrated and tested locally and pushed as a branch. **Not merged to main, not versioned, not tagged, not built for release, installed Konnect untouched** (0.13.0 / 6bbe3e4 at `%LOCALAPPDATA%\Programs\Konnect\v0.13.0\konnect.exe`). Every step marked APPROVAL below waits for an explicit go-ahead.
+Status (updated 2026-11-09): integrated, tested, version bumped to 0.13.1 (approved), pull request opened against kynze/Konnect `main`. **Not merged, not tagged, not built for release, installed Konnect untouched** (0.13.0 / 6bbe3e4 at `%LOCALAPPDATA%\Programs\Konnect\v0.13.0\konnect.exe`). Every step marked APPROVAL below waits for an explicit go-ahead.
 
 ## What is in the branch
 
@@ -23,14 +23,15 @@ Per-task evidence: `docs/AILAB-41-VERIFICATION.md`, `AILAB-42-VERIFICATION.md`, 
 ## Checks done on this tip
 
 - `cargo test --workspace --no-fail-fast` (debug, TEMP outside `C:\tmp`): 41 suites, 2449 passed, 0 failed, 47 ignored (the ignored ones need a live KiCad GUI).
-- Native KiCad 10.0.6 scripts ran per task before integration (41: 5 phases, 42: 6 phases, 48: apply + stale + no-op, 49: 7 modes). They have **not** been re-run on this exact integrated tip.
+- Version 0.13.1 (Cargo workspace and lock files, schematic-viewer manifest, lock and tauri config, `packaging/metadata.json`); the workspace run above and `konnect --version` (`konnect 0.13.1`) are on the bumped tip.
+- Native KiCad 10.0.6 scripts re-run on the integrated 0.13.1 tip, task-built debug binary, scratch config, hidden-desktop editor for 48: AILAB-41 5/5 PASS, AILAB-42 6/6 PASS, AILAB-49 all 7 root-source modes PASS, AILAB-48 stale-revision conflict, apply, native reopen (library pad settings, net, position/orientation/side) and second dry run no-op all PASS.
 - Not verified natively: the 72-footprint and 57-model bulk scenarios, back-side transforms, spoke width.
 
 ## Steps before a release (all APPROVAL unless noted)
 
-1. (no approval) Re-run the native scripts on the integrated tip with the hidden-desktop editor; record results here.
-2. APPROVAL: merge to `main` (or open a PR from the pushed branch; a PR is the lighter option).
-3. APPROVAL: version bump (workspace is `0.13.0`; the installed build is also `0.13.0`, so a new build must carry a new version, e.g. `0.13.1`) and tag. `release.yml` exists; it must not be triggered until the tag is approved. Read it first to know what a tag publishes.
+1. Done: native scripts re-run on the integrated tip (see above).
+2. Done: pull request opened from the pushed branch (approved). APPROVAL still needed to merge it.
+3. Version 0.13.1: done and approved. APPROVAL still needed for the tag. `release.yml` triggers on a pushed `v*` tag (and has a `workflow_dispatch` pre-tag smoke run that creates no release); read it fully before tagging to know what a tag publishes.
 4. Release build from the tagged commit: `cargo build --release -p konnect`, record commit SHA, `rustc --version`, build date, SHA-256 of `konnect.exe`, and `konnect --version` output as provenance.
 5. APPROVAL: install side by side as `%LOCALAPPDATA%\Programs\Konnect\v<new>\konnect.exe`; do not overwrite `v0.13.0`.
 6. APPROVAL: point the MCP client configuration at the new path.
