@@ -914,7 +914,7 @@ async fn handle_create_footprint(
         };
 
         // Validated above; omitted/null writes nothing so the pad inherits.
-        let mask_paste = pad_mask_paste::parse(pad, "", false)
+        let mask_paste = pad_mask_paste::parse_spec(pad, "", false)
             .expect("validated")
             .create_tokens();
         // Validated above: the header describes the front layer, the stack follows.
@@ -1008,7 +1008,7 @@ fn validate_footprint_pad_items(pads: &[serde_json::Value]) -> Result<(), CallTo
                 ));
             }
         }
-        if let Err((field, reason)) = pad_mask_paste::parse(pad, &format!("pads[{index}]."), false)
+        if let Err((field, reason)) = pad_mask_paste::parse_spec(pad, &format!("pads[{index}]."), false)
         {
             return Err(invalid_library_argument(&field, reason));
         }
@@ -1121,7 +1121,7 @@ async fn handle_edit_footprint_pad(
         },
     };
 
-    let mask_paste = match pad_mask_paste::parse(args, "", true) {
+    let mask_paste = match pad_mask_paste::parse_spec(args, "", true) {
         Ok(spec) => spec,
         Err((field, reason)) => return Ok(invalid_library_argument(&field, reason)),
     };
