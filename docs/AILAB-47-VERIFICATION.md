@@ -2,7 +2,7 @@
 
 Scope: the parts of AILAB-47 not already delivered by AILAB-48/49: (2) revision-guarded footprint-ID replacement and (3) bulk application of a library footprint's 3D models. Items 1 and 4 are confirmed done on the base (below). **Native KiCad verification of this work is unverified**; see Limits.
 
-Base: `dcb29c5` (`jbp-kynze/konnect-integration`). Branch: `jbp-kynze/ailab-47-swap-bulk`. The implementation commit hash is the commit carrying this file (see `git log`). CARGO_TARGET_DIR `target-ailab47`, CARGO_BUILD_JOBS=2, no overlapping cargo runs; existing Rust/protoc/CMake reused (`.local` of the sibling worktree), nothing installed.
+Base: `dcb29c5` (`jbp-kynze/konnect-integration`). Branch: `jbp-kynze/ailab-47-swap-bulk`. Implementation commit: `42804c9`; this doc was adjusted in a follow-up commit. CARGO_TARGET_DIR `target-ailab47`, CARGO_BUILD_JOBS=2, no overlapping cargo runs; existing Rust/protoc/CMake reused (`.local` of the sibling worktree), nothing installed.
 
 ## What was built
 
@@ -16,7 +16,7 @@ Start point: `docs/AILAB-48-DEFERRED.patch`. It was made against the pre-verific
 
 ## Red then green
 
-- Red (negative controls, each mutation applied to the finished code, then reverted; the new tests are the guards): 
+- Red (negative controls, each mutation applied to the finished code, then reverted; the new tests are the guards):
   - routed-pad guard disabled: 2 failed (`swap_that_moves_a_routed_pad_needs_explicit_opt_in`, `served_swap_over_routed_pads_refuses_then_applies_only_with_the_reviewed_opt_in`), 62 passed.
   - connected-pad uniqueness check disabled: 3 failed (`replacement_refuses_ambiguous_connected_pad_mapping_without_changing_input`, `swap_with_a_missing_connected_pad_is_refused_naming_the_pad_and_counts`, `swap_with_an_ambiguous_connected_pad_mapping_is_refused_by_the_planner`), 61 passed.
   - models scope falling back to the full rebuild: 3 failed (`fifty_seven_model_refreshes_are_one_bulk_plan`, `served_bulk_models_apply_57_footprints_in_one_commit_touching_only_models`, `bulk_models_scope_does_not_rebuild_pads_even_when_the_library_has_unsupported_pad_clauses`), 61 passed.
