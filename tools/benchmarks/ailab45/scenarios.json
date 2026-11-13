@@ -1,0 +1,7 @@
+﻿{
+  "symbol": {"name":"BenchmarkSensor","reference_prefix":"U","value":"Bench µ sensor","pins":[{"number":"1","name":"IN","type":"input"},{"number":"2","name":"OUT","type":"output"}]},
+  "symbol_edit": {"symbol_name":"BenchmarkSensor","properties":[{"name":"Manufacturer","value":"Sanitized example"}]},
+  "footprint": {"name":"BenchmarkPad","pads":[{"number":"1","type":"smd","shape":"rect","x":0,"y":0,"width":1,"height":1}]},
+  "model_edit": {"mode":"replace","models":[{"path":"models/sanitized.step","rotate":{"x":0,"y":0,"z":90}}]},
+  "pcb_projection": {"kind":"synthetic_not_dispatched","item_count":57,"per_item_calls":[{"name":"get_footprint_properties","arguments":{"reference":"R{index}","board":"scratch.kicad_pcb"}},{"name":"set_footprint_properties","arguments":{"reference":"R{index}","board":"scratch.kicad_pcb","rotation":90}}],"warning":"Illustrative call geometry only; no claim of valid server schema, live mutation or batching savings. Original 114-call user report is independent evidence."}
+}
