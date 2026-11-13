@@ -182,6 +182,7 @@ struct ParsedLibraryProperties {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ChangedDomain {
+    LibraryId,
     Pads,
     Graphics,
     Attributes,
@@ -194,12 +195,24 @@ struct PreparedUpdate {
     item: prost_types::Any,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    moved_routed_pads: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct UpdateFilters {
     references: Option<BTreeSet<String>>,
     library_ids: Option<BTreeSet<String>>,
+    scope: UpdateScope,
+    replacements: BTreeMap<String, String>,
+    allow_routed_pad_movement: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum UpdateScope {
+    #[default]
+    Full,
+    Models,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -292,6 +305,7 @@ struct PlannedUpdate {
     library_id: String,
     changed_domains: BTreeSet<ChangedDomain>,
     preserved: PreservedState,
+    moved_routed_pads: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -309,6 +323,7 @@ struct UpdatePlan {
     changes: Vec<PlannedUpdate>,
     diagnostics: Vec<UpdateDiagnostic>,
     prepared_items: Vec<prost_types::Any>,
+    model_inspections: Vec<serde_json::Value>,
 }
 
 pub(crate) fn tool() -> ToolDef {
@@ -337,6 +352,15 @@ pub(crate) fn tool() -> ToolDef {
                     "items": { "type": "string" },
                     "description": "Optional exact Library:Footprint allowlist"
                 },
+                "scope": { "type": "string", "enum": ["full", "models"], "default": "full", "description": "Models refreshes only complete library model lists in one batch; dry run inspects before/after lists." },
+                "replacements": {
+                    "type": "array", "items": {
+                        "type": "object", "properties": { "reference": { "type": "string", "minLength": 1 }, "library_id": { "type": "string", "minLength": 3 } },
+                        "required": ["reference", "library_id"], "additionalProperties": false
+                    },
+                    "description": "Explicit footprint ID replacements. With omitted references, select only these references. Connected logical pad numbers must map uniquely."
+                },
+                "allow_routed_pad_movement": { "type": "boolean", "default": false, "description": "Explicitly allow changed pad centres on routed nets; copper is unchanged and connectivity requires DRC/reconnection." },
                 "dry_run": {
                     "type": "boolean",
                     "default": true,
@@ -362,7 +386,20 @@ pub(crate) async fn handle_update_footprints_from_library(
     use kiapi::common::types::KiCadObjectType as ObjectType;
 
     let board_path = crate::tools::get_path(args, "board")?;
-    let dry_run = args["dry_run"].as_bool().unwrap_or(true);
+    let dry_run = match args.get("dry_run") {
+        None => true,
+        Some(serde_json::Value::Bool(value)) => *value,
+        _ => return Ok(crate::tools::invalid_arg("dry_run", "must be boolean")),
+    };
+    if args
+        .get("expected_plan_revision")
+        .is_some_and(|value| !value.is_string())
+    {
+        return Ok(crate::tools::invalid_arg(
+            "expected_plan_revision",
+            "must be a string",
+        ));
+    }
     let expected_revision = args["expected_plan_revision"].as_str().map(str::to_string);
     if !dry_run && expected_revision.is_none() {
         return Ok(CallToolResult::error_kind(
@@ -481,6 +518,7 @@ pub(crate) async fn handle_update_footprints_from_library(
              file directly. Open the requested board in KiCad and retry.",
             reason.premise()
         )),
+        // Keep typed recovery/uncertainty evidence from the IPC boundary.
         BoardWrite::Refused(result) => result,
     })
 }
@@ -714,6 +752,8 @@ fn plan_response(plan: &UpdatePlan, applied: bool) -> CallToolResult {
             "conflicts": plan.coverage.conflicts
         },
         "changes": plan.changes,
+        "model_inspections": plan.model_inspections,
+        "routing": { "copper_geometry": "untouched", "connectivity": "not_verified_requires_drc" },
         "diagnostics": plan.diagnostics,
         "undo": if applied {
             Some("Ctrl-Z reverses the whole footprint library update.")
@@ -795,9 +835,85 @@ fn parse_filters(args: &serde_json::Value) -> std::result::Result<UpdateFilters,
         Ok(parsed)
     }
 
+    let scope = match args.get("scope") {
+        None => UpdateScope::Full,
+        Some(serde_json::Value::String(value)) if value == "full" => UpdateScope::Full,
+        Some(serde_json::Value::String(value)) if value == "models" => UpdateScope::Models,
+        _ => {
+            return Err(ArgumentError {
+                field: "scope".into(),
+                reason: "must be full or models".into(),
+            })
+        }
+    };
+    let allow_routed_pad_movement = match args.get("allow_routed_pad_movement") {
+        None => false,
+        Some(serde_json::Value::Bool(value)) => *value,
+        _ => {
+            return Err(ArgumentError {
+                field: "allow_routed_pad_movement".into(),
+                reason: "must be boolean".into(),
+            })
+        }
+    };
+    let mut replacements = BTreeMap::new();
+    if let Some(value) = args.get("replacements") {
+        let entries = value.as_array().ok_or_else(|| ArgumentError {
+            field: "replacements".into(),
+            reason: "must be an array".into(),
+        })?;
+        for entry in entries {
+            let reference = entry
+                .get("reference")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.trim().is_empty());
+            let library_id = entry
+                .get("library_id")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| super::library::is_lib_id(v));
+            let (Some(reference), Some(library_id)) = (reference, library_id) else {
+                return Err(ArgumentError {
+                    field: "replacements".into(),
+                    reason:
+                        "each entry requires an exact reference and Library:Footprint library_id"
+                            .into(),
+                });
+            };
+            if replacements
+                .insert(reference.to_string(), library_id.to_string())
+                .is_some()
+            {
+                return Err(ArgumentError {
+                    field: "replacements".into(),
+                    reason: format!("duplicate reference '{reference}'"),
+                });
+            }
+        }
+    }
+    if scope == UpdateScope::Models && !replacements.is_empty() {
+        return Err(ArgumentError {
+            field: "replacements".into(),
+            reason: "footprint ID replacement requires scope full".into(),
+        });
+    }
+    let references = parse(args, "references")?
+        .or_else(|| (!replacements.is_empty()).then(|| replacements.keys().cloned().collect()));
+    if replacements.keys().any(|reference| {
+        references
+            .as_ref()
+            .is_some_and(|refs| !refs.contains(reference))
+    }) {
+        return Err(ArgumentError {
+            field: "replacements".into(),
+            reason: "every replacement reference must be selected by references".into(),
+        });
+    }
     Ok(UpdateFilters {
-        references: parse(args, "references")?,
+        references,
         library_ids: parse(args, "library_ids")?,
+        scope,
+        replacements,
+        allow_routed_pad_movement,
     })
 }
 
@@ -928,7 +1044,26 @@ fn plan_updates(
     hasher.update(serde_json::to_vec(routed_nets).expect("routed nets serialize"));
     let mut changes = Vec::new();
     let mut prepared_items = Vec::new();
-    for candidate in selected {
+    let mut model_inspections = Vec::new();
+    let mut library_sources = BTreeMap::<String, String>::new();
+    for (reference, _) in &filters.replacements {
+        if !selected
+            .iter()
+            .any(|candidate| &candidate.reference == reference)
+        {
+            diagnostics.push(UpdateDiagnostic {
+                code: "replacement_not_selected".into(),
+                message: format!(
+                    "replacement reference '{reference}' is absent or excluded by filters"
+                ),
+                reference: Some(reference.clone()),
+            });
+        }
+    }
+    for mut candidate in selected {
+        if let Some(library_id) = filters.replacements.get(&candidate.reference) {
+            candidate.library_id = library_id.clone();
+        }
         if candidate.library_id.is_empty() {
             continue;
         }
@@ -955,54 +1090,78 @@ fn plan_updates(
             continue;
         }
 
-        let library_path = match super::library::resolve_footprint_path(
-            &candidate.library_id,
-            board_path.parent(),
-        ) {
-            Ok(path) => path,
-            Err(message) => {
-                diagnostics.push(UpdateDiagnostic {
-                    code: "footprint_library_resolution_failed".to_string(),
-                    message,
-                    reference: Some(candidate.reference),
-                });
-                continue;
+        let source = if let Some(source) = library_sources.get(&candidate.library_id) {
+            source.clone()
+        } else {
+            let path = match super::library::resolve_footprint_path(
+                &candidate.library_id,
+                board_path.parent(),
+            ) {
+                Ok(path) => path,
+                Err(message) => {
+                    diagnostics.push(UpdateDiagnostic {
+                        code: "footprint_library_resolution_failed".into(),
+                        message,
+                        reference: Some(candidate.reference),
+                    });
+                    continue;
+                }
+            };
+            match std::fs::read_to_string(&path) {
+                Ok(source) => {
+                    library_sources.insert(candidate.library_id.clone(), source.clone());
+                    source
+                }
+                Err(error) => {
+                    diagnostics.push(UpdateDiagnostic {
+                        code: "footprint_library_read_failed".into(),
+                        message: format!("failed to read {}: {error}", path.display()),
+                        reference: Some(candidate.reference),
+                    });
+                    continue;
+                }
             }
         };
-        let source = match std::fs::read_to_string(&library_path) {
-            Ok(source) => source,
-            Err(error) => {
-                diagnostics.push(UpdateDiagnostic {
-                    code: "footprint_library_read_failed".to_string(),
-                    message: format!("failed to read {}: {error}", library_path.display()),
-                    reference: Some(candidate.reference),
-                });
-                continue;
+        let prepared = match if filters.scope == UpdateScope::Models {
+            build_model_update(&candidate.instance, &source)
+        } else {
+            match parse_library_footprint(&candidate.library_id, &source) {
+                Ok(library) => {
+                    build_updated_instance(&candidate.instance, &library, net_codes, routed_nets)
+                }
+                Err(error) => {
+                    diagnostics.push(UpdateDiagnostic {
+                        code: "unsupported_library_footprint".into(),
+                        message: format!("{error:#}"),
+                        reference: Some(candidate.reference),
+                    });
+                    continue;
+                }
             }
-        };
-        let library = match parse_library_footprint(&candidate.library_id, &source) {
-            Ok(library) => library,
+        } {
+            Ok(prepared) => prepared,
             Err(error) => {
                 diagnostics.push(UpdateDiagnostic {
-                    code: "unsupported_library_footprint".to_string(),
+                    code: "footprint_update_conflict".into(),
                     message: format!("{error:#}"),
                     reference: Some(candidate.reference),
                 });
                 continue;
             }
         };
-        let prepared =
-            match build_updated_instance(&candidate.instance, &library, net_codes, routed_nets) {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    diagnostics.push(UpdateDiagnostic {
-                        code: "footprint_update_conflict".to_string(),
-                        message: format!("{error:#}"),
-                        reference: Some(candidate.reference),
-                    });
-                    continue;
-                }
-            };
+        if !prepared.moved_routed_pads.is_empty() && !filters.allow_routed_pad_movement {
+            diagnostics.push(UpdateDiagnostic { code: "routed_pad_movement_requires_opt_in".into(), message: format!("{} pads {:?} move on routed nets; copper geometry stays unchanged and may become unconnected. Review and set allow_routed_pad_movement=true; run DRC/reconnect afterwards", candidate.reference, prepared.moved_routed_pads), reference: Some(candidate.reference) });
+            continue;
+        }
+        if filters.scope == UpdateScope::Models {
+            let updated =
+                kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice())
+                    .expect("prepared typed item");
+            match (konnect_ipc::KiCadIpcClient::footprint_3d_models(&candidate.instance), konnect_ipc::KiCadIpcClient::footprint_3d_models(&updated)) {
+                (Ok(before), Ok(after)) => model_inspections.push(json!({ "reference": candidate.reference, "library_id": candidate.library_id, "before": before, "after": after })),
+                (before, after) => { diagnostics.push(UpdateDiagnostic { code: "model_inspection_failed".into(), message: format!("before: {before:?}; after: {after:?}"), reference: Some(candidate.reference) }); continue; }
+            }
+        }
 
         hasher.update(candidate.item.type_url.as_bytes());
         hasher.update(&candidate.item.value);
@@ -1017,6 +1176,7 @@ fn plan_updates(
                 library_id: candidate.library_id,
                 changed_domains: prepared.changed_domains,
                 preserved: prepared.preserved,
+                moved_routed_pads: prepared.moved_routed_pads,
             });
             prepared_items.push(prepared.item);
         }
@@ -1034,6 +1194,7 @@ fn plan_updates(
             changes,
             diagnostics,
             prepared_items,
+            model_inspections,
         };
     }
 
@@ -1049,6 +1210,7 @@ fn plan_updates(
         changes,
         diagnostics,
         prepared_items,
+        model_inspections,
     }
 }
 
@@ -1803,12 +1965,7 @@ fn build_updated_instance(
         .as_ref()
         .map(|id| format!("{}:{}", id.library_nickname, id.entry_name))
         .unwrap_or_default();
-    if current_id != library.library_id {
-        bail!(
-            "board footprint library id '{current_id}' does not match '{}'",
-            library.library_id
-        );
-    }
+    let replacing = current_id != library.library_id;
 
     let mut old_nets = BTreeMap::<String, kiapi::board::types::Net>::new();
     for item in &current_definition.items {
@@ -1828,6 +1985,27 @@ fn build_updated_instance(
                     existing.name,
                     net.name
                 );
+            }
+        }
+    }
+    if replacing {
+        for number in old_nets.keys() {
+            let old_count = current_definition
+                .items
+                .iter()
+                .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?
+                .iter()
+                .filter(|pad| &pad.number == number)
+                .count();
+            let new_count = library
+                .pads
+                .iter()
+                .filter(|pad| &pad.number == number)
+                .count();
+            if old_count != 1 || new_count != 1 {
+                bail!("replacement requires a unique mapping for connected pad {number}; old count {old_count}, new count {new_count}");
             }
         }
     }
@@ -1908,7 +2086,9 @@ fn build_updated_instance(
             konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
         }),
     );
+    let mut moved_routed_pads = Vec::new();
     let mut pad_index = 0;
+    let mut pad_occurrences = BTreeMap::<String, usize>::new();
     for item in &mut definition.items {
         if item.type_url.ends_with("kiapi.board.types.Pad") {
             let mut pad = kiapi::board::types::Pad::decode(item.value.as_slice())?;
@@ -1918,6 +2098,33 @@ fn build_updated_instance(
                 .context("library pad override count differs from typed pads")?
                 .apply(&mut pad)?;
             pad_index += 1;
+            let matching = current_definition
+                .items
+                .iter()
+                .filter(|item| item.type_url.ends_with("kiapi.board.types.Pad"))
+                .map(|item| kiapi::board::types::Pad::decode(item.value.as_slice()))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .filter(|old| old.number == pad.number)
+                .collect::<Vec<_>>();
+            // Stable occurrence mapping also handles same-number physical pads
+            // during same-ID refresh, without assigning one old UUID twice.
+            let occurrence = pad_occurrences.entry(pad.number.clone()).or_default();
+            let old = matching.get(*occurrence);
+            *occurrence += 1;
+            if let Some(old) = old {
+                pad.id = old.id.clone();
+                pad.symbol_pin = old.symbol_pin.clone();
+                pad.locked = old.locked;
+                if old.position != pad.position
+                    && old
+                        .net
+                        .as_ref()
+                        .is_some_and(|net| routed_nets.contains(&net.name))
+                {
+                    moved_routed_pads.push(pad.number.clone());
+                }
+            }
             pad.net = old_nets
                 .get(&pad.number)
                 .map(|old| kiapi::board::types::Net {
@@ -1968,6 +2175,39 @@ fn build_updated_instance(
         item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
         changed_domains,
         preserved,
+        moved_routed_pads,
+    })
+}
+
+fn build_model_update(
+    current: &kiapi::board::types::FootprintInstance,
+    source: &str,
+) -> Result<PreparedUpdate> {
+    let root = konnect_sexp::parse_sexp(source).context("invalid footprint S-expression")?;
+    if root.head() != Some("footprint") {
+        bail!("library source root must be a footprint");
+    }
+    let models = super::library_footprint::models(&root)?;
+    let mut updated = current.clone();
+    let definition = updated
+        .definition
+        .as_mut()
+        .context("board footprint has no definition")?;
+    definition.items.retain(|item| {
+        !item
+            .type_url
+            .ends_with("kiapi.board.types.Footprint3DModel")
+    });
+    definition.items.extend(
+        models.iter().map(|model| {
+            konnect_ipc::builders::pack_any(model, "kiapi.board.types.Footprint3DModel")
+        }),
+    );
+    Ok(PreparedUpdate {
+        changed_domains: changed_domains(current, &updated)?,
+        preserved: PreservedState::derive(current, &updated, &BTreeMap::new()),
+        moved_routed_pads: Vec::new(),
+        item: konnect_ipc::builders::pack_any(&updated, "kiapi.board.types.FootprintInstance"),
     })
 }
 
@@ -2411,6 +2651,9 @@ fn changed_domains(
         .as_ref()
         .context("missing updated definition")?;
 
+    if current_definition.id != updated_definition.id {
+        changed.insert(ChangedDomain::LibraryId);
+    }
     let current_pads = normalized_items(current_definition, "Pad")?;
     let updated_pads = normalized_items(updated_definition, "Pad")?;
     if current_pads != updated_pads {
@@ -3651,6 +3894,71 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_instance_and_maps_connected_pad_numbers() {
+        let source = LIBRARY_FOOTPRINT.replace(
+            "  (pad \"1\" smd rect (at -1 0) (size 1 1) (layers \"B.Cu\"))",
+            "",
+        );
+        let library = parse_library_footprint("Test:Replacement", &source).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let before = current.encode_to_vec();
+        let prepared =
+            build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new()).unwrap();
+        let updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(updated.id, current.id);
+        assert_eq!(updated.position, current.position);
+        assert_eq!(updated.orientation, current.orientation);
+        assert_eq!(updated.layer, current.layer);
+        assert_eq!(updated.symbol_path, current.symbol_path);
+        assert_eq!(decoded_pads(&updated)[0].net, decoded_pads(&current)[0].net);
+        assert_eq!(
+            updated
+                .definition
+                .as_ref()
+                .unwrap()
+                .id
+                .as_ref()
+                .unwrap()
+                .entry_name,
+            "Replacement"
+        );
+        assert_eq!(current.encode_to_vec(), before);
+    }
+
+    #[test]
+    fn fifty_seven_model_refreshes_are_one_bulk_plan() {
+        let (_temp, board, _) = plan_fixture();
+        let items = (1..=57)
+            .map(|n| plan_item(&format!("U{n}"), Some("Test:Socket"), &format!("id-{n}")))
+            .collect::<Vec<_>>();
+        let filters = parse_filters(&json!({"scope": "models"})).unwrap();
+        let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
+        assert_eq!(plan.status, PlanStatus::Ready);
+        assert_eq!(plan.prepared_items.len(), 57);
+        for change in &plan.changes {
+            assert_eq!(
+                change.changed_domains,
+                BTreeSet::from([ChangedDomain::Models])
+            );
+        }
+        assert_eq!(plan.model_inspections.len(), 57);
+        for after in &plan.prepared_items {
+            let after =
+                kiapi::board::types::FootprintInstance::decode(after.value.as_slice()).unwrap();
+            let before = items
+                .iter()
+                .map(|item| {
+                    kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+                })
+                .find(|fp| fp.id == after.id)
+                .unwrap();
+            assert_eq!(before.id, after.id);
+            assert_eq!(decoded_pads(&before), decoded_pads(&after));
+        }
+    }
+
+    #[test]
     fn seventy_two_instances_include_sixty_six_formerly_rejected_pad_settings() {
         for index in 0..72 {
             let source = if index < 66 {
@@ -3791,6 +4099,54 @@ mod tests {
             let error = parse_library_footprint("Test:Socket", &source).unwrap_err();
             assert!(error.to_string().contains(field), "{error:#}");
         }
+    }
+
+    #[test]
+    fn replacement_refuses_ambiguous_connected_pad_mapping_without_changing_input() {
+        let library = parse_library_footprint("Test:Replacement", LIBRARY_FOOTPRINT).unwrap();
+        let current = current_instance(kiapi::board::types::BoardLayer::BlFCu);
+        let before = current.encode_to_vec();
+        let error = build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unique mapping for connected pad 1"),
+            "{error:#}"
+        );
+        assert_eq!(before, current.encode_to_vec());
+    }
+
+    #[test]
+    fn model_only_update_preserves_every_non_model_byte_and_order() {
+        let mut current = current_instance(kiapi::board::types::BoardLayer::BlBCu);
+        let source = LIBRARY_FOOTPRINT.replace(
+            "(roundrect_rratio 0.2))",
+            "(roundrect_rratio 0.2) (unsupported_future_pad_clause 1))",
+        );
+        // Model refresh deliberately does not rebuild unrelated geometry.
+        let prepared = build_model_update(&current, &source).unwrap();
+        let mut updated =
+            kiapi::board::types::FootprintInstance::decode(prepared.item.value.as_slice()).unwrap();
+        assert_eq!(
+            prepared.changed_domains,
+            BTreeSet::from([ChangedDomain::Models])
+        );
+        let again = build_model_update(&updated, &source).unwrap();
+        assert!(again.changed_domains.is_empty());
+        current
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .retain(|item| !item.type_url.ends_with("Footprint3DModel"));
+        updated
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .retain(|item| !item.type_url.ends_with("Footprint3DModel"));
+        assert_eq!(updated.encode_to_vec(), current.encode_to_vec());
     }
 
     #[test]
@@ -4477,7 +4833,33 @@ mod tests {
         fail_update: bool,
         corrupt_commits: usize,
     ) -> PlannerMock {
+        spawn_planner_mock_full(board, footprints, fail_update, corrupt_commits, &[])
+    }
+
+    /// `routed_nets` get one routed track each, so copper exists on those nets.
+    fn spawn_planner_mock_full(
+        board: &Path,
+        footprints: Vec<prost_types::Any>,
+        fail_update: bool,
+        corrupt_commits: usize,
+        routed_nets: &[&str],
+    ) -> PlannerMock {
         use nng::options::Options;
+        let tracks = routed_nets
+            .iter()
+            .map(|name| {
+                builders::pack_any(
+                    &kiapi::board::types::Track {
+                        net: Some(kiapi::board::types::Net {
+                            code: None,
+                            name: (*name).to_string(),
+                        }),
+                        ..Default::default()
+                    },
+                    "kiapi.board.types.Track",
+                )
+            })
+            .collect::<Vec<_>>();
 
         static NEXT_MOCK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let url = format!(
@@ -4525,6 +4907,10 @@ mod tests {
                     {
                         captured.lock().unwrap().footprint_reads += 1;
                         footprints.clone()
+                    } else if command.types
+                        == vec![kiapi::common::types::KiCadObjectType::KotPcbTrace as i32]
+                    {
+                        tracks.clone()
                     } else {
                         Vec::new()
                     };
@@ -4887,6 +5273,730 @@ mod tests {
         assert_eq!(
             capture.commit_actions,
             vec![kiapi::common::commands::CommitAction::CmaDrop]
+        );
+    }
+
+    // ---- AILAB-47: footprint ID replacement and bulk model refresh ----
+
+    const REPLACEMENT_FOOTPRINT: &str = r#"
+(footprint "Replacement"
+  (version 20240108)
+  (generator "konnect")
+  (layer "F.Cu")
+  (descr "swap target")
+  (attr smd)
+  (pad "1" smd rect (at -1.5 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask"))
+  (pad "2" smd rect (at 1.5 0) (size 1 1) (layers "F.Cu" "F.Paste" "F.Mask"))
+  (fp_text reference "REF**" (at 0 -2 0) (layer "F.SilkS")
+    (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "Replacement" (at 0 2 0) (layer "F.Fab")
+    (effects (font (size 1 1) (thickness 0.15))))
+  (model "../models/Replacement.step"
+    (offset (xyz 0 0 0))
+    (scale (xyz 1 1 1))
+    (rotate (xyz 0 0 0)))
+)
+"#;
+
+    /// Same as the replacement, but the pad that carries COL1 is gone.
+    fn missing_pad_footprint() -> String {
+        REPLACEMENT_FOOTPRINT.replace(
+            "  (pad \"2\" smd rect (at 1.5 0) (size 1 1) (layers \"F.Cu\" \"F.Paste\" \"F.Mask\"))\n",
+            "",
+        )
+    }
+
+    fn swap_fixture() -> (tempfile::TempDir, std::path::PathBuf, Vec<prost_types::Any>) {
+        let (temp, board, items) = plan_fixture();
+        let library = temp.path().join("Test.pretty");
+        std::fs::write(library.join("Replacement.kicad_mod"), REPLACEMENT_FOOTPRINT).unwrap();
+        std::fs::write(library.join("Missing.kicad_mod"), missing_pad_footprint()).unwrap();
+        std::fs::write(library.join("Ambiguous.kicad_mod"), LIBRARY_FOOTPRINT).unwrap();
+        (temp, board, items)
+    }
+
+    fn swap_filters(reference: &str, library_id: &str) -> UpdateFilters {
+        parse_filters(
+            &json!({"replacements": [{"reference": reference, "library_id": library_id}]}),
+        )
+        .unwrap()
+    }
+
+    fn decode_instance(item: &prost_types::Any) -> kiapi::board::types::FootprintInstance {
+        kiapi::board::types::FootprintInstance::decode(item.value.as_slice()).unwrap()
+    }
+
+    fn only_diagnostic(plan: &UpdatePlan) -> &UpdateDiagnostic {
+        assert_eq!(plan.diagnostics.len(), 1, "{:?}", plan.diagnostics);
+        &plan.diagnostics[0]
+    }
+
+    #[test]
+    fn swap_plan_replaces_only_the_selected_reference_and_keeps_identity() {
+        let (_temp, board, items) = swap_fixture();
+        let filters = swap_filters("SW1", "Test:Replacement");
+        let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
+        assert_eq!(plan.status, PlanStatus::Ready, "{:?}", plan.diagnostics);
+        assert_eq!(plan.changes.len(), 1);
+        assert_eq!(plan.changes[0].reference, "SW1");
+        assert_eq!(plan.changes[0].library_id, "Test:Replacement");
+        assert!(plan.changes[0]
+            .changed_domains
+            .contains(&ChangedDomain::LibraryId));
+        assert!(plan.changes[0].moved_routed_pads.is_empty());
+        let before = decode_instance(&items[2]);
+        let after = decode_instance(&plan.prepared_items[0]);
+        let id = after.definition.as_ref().unwrap().id.as_ref().unwrap();
+        assert_eq!(
+            (id.library_nickname.as_str(), id.entry_name.as_str()),
+            ("Test", "Replacement")
+        );
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.position, before.position);
+        assert_eq!(after.orientation, before.orientation);
+        assert_eq!(after.layer, before.layer);
+        assert_eq!(after.locked, before.locked);
+        assert_eq!(after.symbol_path, before.symbol_path);
+        let nets = |fp: &kiapi::board::types::FootprintInstance| {
+            decoded_pads(fp)
+                .into_iter()
+                .map(|pad| (pad.number, pad.net.map(|net| net.name)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            nets(&after),
+            vec![
+                ("1".to_string(), Some("ROW1".to_string())),
+                ("2".to_string(), Some("COL1".to_string()))
+            ]
+        );
+        // Linkage of the connected pads survives: same pad identities and symbol pins.
+        for (new, old) in decoded_pads(&after)
+            .iter()
+            .zip(decoded_pads(&before).iter())
+        {
+            assert_eq!(new.id, old.id);
+            assert_eq!(new.symbol_pin, old.symbol_pin);
+        }
+    }
+
+    #[test]
+    fn swap_with_a_missing_connected_pad_is_refused_naming_the_pad_and_counts() {
+        let (_temp, board, items) = swap_fixture();
+        let filters = swap_filters("SW1", "Test:Missing");
+        let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        let diagnostic = only_diagnostic(&plan);
+        assert_eq!(diagnostic.code, "footprint_update_conflict");
+        assert_eq!(diagnostic.reference.as_deref(), Some("SW1"));
+        assert!(
+            diagnostic
+                .message
+                .contains("unique mapping for connected pad 2; old count 1, new count 0"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(plan.prepared_items.is_empty() && plan.changes.is_empty());
+    }
+
+    #[test]
+    fn swap_with_an_ambiguous_connected_pad_mapping_is_refused_by_the_planner() {
+        let (_temp, board, items) = swap_fixture();
+        let filters = swap_filters("SW1", "Test:Ambiguous");
+        let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
+        assert_eq!(plan.status, PlanStatus::Conflict);
+        let diagnostic = only_diagnostic(&plan);
+        assert_eq!(diagnostic.code, "footprint_update_conflict");
+        assert!(
+            diagnostic
+                .message
+                .contains("unique mapping for connected pad 1; old count 1, new count 2"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(plan.prepared_items.is_empty() && plan.changes.is_empty());
+    }
+
+    #[test]
+    fn swap_of_an_unknown_or_unselected_reference_or_library_is_a_conflict() {
+        let (_temp, board, items) = swap_fixture();
+        for (filters, code) in [
+            (
+                swap_filters("NOPE", "Test:Replacement"),
+                "reference_not_found",
+            ),
+            (
+                swap_filters("SW1", "Test:DoesNotExist"),
+                "footprint_library_resolution_failed",
+            ),
+            (
+                parse_filters(&json!({
+                    "references": ["SW2"],
+                    "replacements": [{"reference": "SW2", "library_id": "Test:Replacement"}],
+                    "library_ids": ["Test:Other"]
+                }))
+                .unwrap(),
+                "replacement_not_selected",
+            ),
+        ] {
+            let plan = plan_updates(&board, &items, &BTreeMap::new(), &BTreeSet::new(), &filters);
+            assert_eq!(plan.status, PlanStatus::Conflict, "{code}");
+            assert!(
+                plan.diagnostics.iter().any(|d| d.code == code),
+                "{code}: {:?}",
+                plan.diagnostics
+            );
+            assert!(plan.prepared_items.is_empty(), "{code}");
+        }
+    }
+
+    #[test]
+    fn swap_that_moves_a_routed_pad_needs_explicit_opt_in() {
+        let (_temp, board, items) = swap_fixture();
+        let routed = BTreeSet::from(["ROW1".to_string()]);
+        let refused = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &routed,
+            &swap_filters("SW1", "Test:Replacement"),
+        );
+        assert_eq!(refused.status, PlanStatus::Conflict);
+        let diagnostic = only_diagnostic(&refused);
+        assert_eq!(diagnostic.code, "routed_pad_movement_requires_opt_in");
+        assert!(
+            diagnostic.message.contains("[\"1\"]"),
+            "only the pad on the routed net: {}",
+            diagnostic.message
+        );
+        assert!(refused.prepared_items.is_empty());
+
+        let allowed_filters = parse_filters(&json!({
+            "replacements": [{"reference": "SW1", "library_id": "Test:Replacement"}],
+            "allow_routed_pad_movement": true
+        }))
+        .unwrap();
+        let allowed = plan_updates(&board, &items, &BTreeMap::new(), &routed, &allowed_filters);
+        assert_eq!(
+            allowed.status,
+            PlanStatus::Ready,
+            "{:?}",
+            allowed.diagnostics
+        );
+        assert_eq!(allowed.changes[0].moved_routed_pads, vec!["1".to_string()]);
+        assert_ne!(
+            allowed.plan_revision, refused.plan_revision,
+            "the opt-in is part of the reviewed plan"
+        );
+
+        // Without copper on those nets nothing needs the opt-in.
+        let unrouted = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &swap_filters("SW1", "Test:Replacement"),
+        );
+        assert_eq!(unrouted.status, PlanStatus::Ready);
+        assert!(unrouted.changes[0].moved_routed_pads.is_empty());
+    }
+
+    #[test]
+    fn swap_keeps_position_rotation_side_and_pad_mapping_on_both_sides_at_every_rotation() {
+        let library = parse_library_footprint("Test:Replacement", REPLACEMENT_FOOTPRINT).unwrap();
+        for side in [
+            kiapi::board::types::BoardLayer::BlFCu,
+            kiapi::board::types::BoardLayer::BlBCu,
+        ] {
+            for rotation in [0.0, 37.0, 90.0, 180.0, 270.0] {
+                let mut current = current_instance(side);
+                current.orientation = Some(kiapi::common::types::Angle {
+                    value_degrees: rotation,
+                });
+                let prepared =
+                    build_updated_instance(&current, &library, &BTreeMap::new(), &BTreeSet::new())
+                        .unwrap();
+                let updated = decode_instance(&prepared.item);
+                assert_eq!(updated.position, current.position, "{side:?} {rotation}");
+                assert_eq!(
+                    updated.orientation, current.orientation,
+                    "{side:?} {rotation}"
+                );
+                assert_eq!(updated.layer, current.layer, "{side:?} {rotation}");
+                assert_eq!(updated.id, current.id);
+                let back = side == kiapi::board::types::BoardLayer::BlBCu;
+                for pad in decoded_pads(&updated) {
+                    let layers = pad.pad_stack.as_ref().unwrap().layers.clone();
+                    let expected = if back {
+                        kiapi::board::types::BoardLayer::BlBCu
+                    } else {
+                        kiapi::board::types::BoardLayer::BlFCu
+                    } as i32;
+                    assert!(
+                        layers.contains(&expected),
+                        "{side:?} {rotation} pad {}: {layers:?}",
+                        pad.number
+                    );
+                }
+                let numbers = decoded_pads(&updated)
+                    .into_iter()
+                    .map(|pad| pad.number)
+                    .collect::<Vec<_>>();
+                assert_eq!(numbers, vec!["1", "2"]);
+                // Re-planning against the swapped footprint is a no-op: nothing drifts.
+                let again =
+                    build_updated_instance(&updated, &library, &BTreeMap::new(), &BTreeSet::new())
+                        .unwrap();
+                assert!(
+                    again.changed_domains.is_empty(),
+                    "{side:?} {rotation}: {:?}",
+                    again.changed_domains
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn served_schema_and_argument_validation_for_swap_and_bulk() {
+        let schema = tool().input_schema;
+        let properties = &schema["properties"];
+        assert_eq!(properties["scope"]["enum"], json!(["full", "models"]));
+        assert_eq!(properties["scope"]["default"], "full");
+        assert_eq!(properties["allow_routed_pad_movement"]["default"], false);
+        assert_eq!(
+            properties["replacements"]["items"]["required"],
+            json!(["reference", "library_id"])
+        );
+        assert_eq!(
+            properties["replacements"]["items"]["additionalProperties"],
+            false
+        );
+        for (arguments, field) in [
+            (json!({"scope": "everything"}), "scope"),
+            (json!({"scope": 3}), "scope"),
+            (
+                json!({"allow_routed_pad_movement": "yes"}),
+                "allow_routed_pad_movement",
+            ),
+            (json!({"replacements": "D1"}), "replacements"),
+            (
+                json!({"replacements": [{"reference": "D1"}]}),
+                "replacements",
+            ),
+            (
+                json!({"replacements": [{"reference": "D1", "library_id": "NoColon"}]}),
+                "replacements",
+            ),
+            (
+                json!({"replacements": [{"reference": " ", "library_id": "A:B"}]}),
+                "replacements",
+            ),
+            (
+                json!({"replacements": [{"reference": "D1", "library_id": "A:B"}, {"reference": "D1", "library_id": "A:C"}]}),
+                "replacements",
+            ),
+            (
+                json!({"scope": "models", "replacements": [{"reference": "D1", "library_id": "A:B"}]}),
+                "replacements",
+            ),
+            (
+                json!({"references": ["D2"], "replacements": [{"reference": "D1", "library_id": "A:B"}]}),
+                "replacements",
+            ),
+        ] {
+            let error = parse_filters(&arguments).expect_err(&arguments.to_string());
+            assert_eq!(error.field, field, "{arguments}");
+        }
+    }
+
+    #[tokio::test]
+    async fn served_invalid_swap_arguments_are_structured_errors_before_ipc() {
+        let temp = tempfile::tempdir().unwrap();
+        let board = temp.path().join("board.kicad_pcb");
+        std::fs::write(&board, "(kicad_pcb (version 20240108))").unwrap();
+        for arguments in [
+            json!({"board": board, "scope": "bogus"}),
+            json!({"board": board, "replacements": [{"reference": "D1", "library_id": "bad"}]}),
+            json!({"board": board, "allow_routed_pad_movement": 1}),
+        ] {
+            let result = handle_update_footprints_from_library(&arguments, &test_context(""))
+                .await
+                .unwrap();
+            assert!(result.is_error, "{arguments}");
+            assert_eq!(
+                crate::mcp::error::extract_error_kind(&result).as_deref(),
+                Some("invalid_argument"),
+                "{arguments}"
+            );
+        }
+    }
+
+    async fn served_handler(url: &str) -> crate::mcp::handler::McpHandler {
+        crate::mcp::handler::McpHandler::new(crate::tools::ServerConfig {
+            kicad_cli: String::new(),
+            kicad_binary: String::new(),
+            ipc_address: url.to_string(),
+            project_dir: None,
+            jlcpcb_db_path: None,
+            auto_load_toolsets: false,
+            eager_toolsets: true,
+        })
+        .await
+        .unwrap()
+    }
+
+    async fn served_call(
+        handler: &crate::mcp::handler::McpHandler,
+        arguments: serde_json::Value,
+    ) -> serde_json::Value {
+        let response = handler
+            .handle_message(json!({"jsonrpc":"2.0", "id":47, "method":"tools/call",
+                "params":{"name":"update_footprints_from_library", "arguments":arguments}}))
+            .await
+            .unwrap();
+        let result = response.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap().to_string();
+        match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(value) if result["isError"] != true => value,
+            _ => json!({"is_error": true, "message": text}),
+        }
+    }
+
+    #[tokio::test]
+    async fn served_tool_list_advertises_swap_and_bulk_arguments() {
+        let handler = served_handler("").await;
+        let response = handler
+            .handle_message(json!({"jsonrpc":"2.0", "id":1, "method":"tools/list"}))
+            .await
+            .unwrap();
+        let tools = response.result.unwrap()["tools"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == "update_footprints_from_library")
+            .expect("tool is served");
+        let properties = &tool["inputSchema"]["properties"];
+        for name in ["scope", "replacements", "allow_routed_pad_movement"] {
+            assert!(
+                properties.get(name).is_some(),
+                "{name} missing from served schema"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn served_swap_is_dry_run_guarded_and_applies_in_one_verified_commit() {
+        let (_temp, board, items) = swap_fixture();
+        let before = items[2].clone();
+        let mock = spawn_planner_mock(&board, before.clone(), false);
+        let handler = served_handler(&mock.url).await;
+        let swap = json!([{"reference": "SW1", "library_id": "Test:Replacement"}]);
+        let dry = served_call(&handler, json!({"board": board, "replacements": swap})).await;
+        assert_eq!(dry["status"], "ready", "{dry}");
+        assert_eq!(dry["changes"][0]["library_id"], "Test:Replacement");
+        assert_eq!(dry["changes"][0]["changed_domains"][0], "library_id");
+
+        // A plan reviewed for another replacement set is stale: nothing is opened or sent.
+        let other = json!([{"reference": "SW1", "library_id": "Test:Socket"}]);
+        let other_dry = served_call(&handler, json!({"board": board, "replacements": other})).await;
+        let stale = served_call(
+            &handler,
+            json!({"board": board, "replacements": swap, "dry_run": false,
+                   "expected_plan_revision": other_dry["plan_revision"]}),
+        )
+        .await;
+        assert_eq!(stale["status"], "conflict");
+        assert_eq!(stale["diagnostics"][0]["code"], "stale_plan_revision");
+        {
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.begin_count, 0);
+            assert!(capture.update_batches.is_empty());
+        }
+
+        let applied = served_call(
+            &handler,
+            json!({"board": board, "replacements": swap, "dry_run": false,
+                   "expected_plan_revision": dry["plan_revision"]}),
+        )
+        .await;
+        assert_eq!(applied["status"], "applied", "{applied}");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 1);
+        assert_eq!(capture.update_batches, vec![1]);
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+        let after = decode_instance(&capture.final_items[0]);
+        let old = decode_instance(&before);
+        assert_eq!(
+            after
+                .definition
+                .as_ref()
+                .unwrap()
+                .id
+                .as_ref()
+                .unwrap()
+                .entry_name,
+            "Replacement"
+        );
+        assert_eq!(after.id, old.id);
+        assert_eq!(after.position, old.position);
+        assert_eq!(after.orientation, old.orientation);
+        assert_eq!(after.layer, old.layer);
+        assert_eq!(after.symbol_path, old.symbol_path);
+        assert_eq!(decoded_pads(&after).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn served_swap_over_routed_pads_refuses_then_applies_only_with_the_reviewed_opt_in() {
+        let (_temp, board, items) = swap_fixture();
+        let mock = spawn_planner_mock_full(&board, vec![items[2].clone()], false, 0, &["ROW1"]);
+        let handler = served_handler(&mock.url).await;
+        let swap = json!([{"reference": "SW1", "library_id": "Test:Replacement"}]);
+        let refused = served_call(&handler, json!({"board": board, "replacements": swap})).await;
+        assert_eq!(refused["status"], "conflict");
+        assert_eq!(
+            refused["diagnostics"][0]["code"],
+            "routed_pad_movement_requires_opt_in"
+        );
+
+        let opted =
+            json!({"board": board, "replacements": swap, "allow_routed_pad_movement": true});
+        let dry = served_call(&handler, opted.clone()).await;
+        assert_eq!(dry["status"], "ready", "{dry}");
+        assert_eq!(dry["changes"][0]["moved_routed_pads"], json!(["1"]));
+        assert_eq!(dry["routing"]["copper_geometry"], "untouched");
+        assert_eq!(dry["routing"]["connectivity"], "not_verified_requires_drc");
+        // The opt-in is part of the revision: a revision reviewed without it cannot apply with it.
+        let mut stale_args = opted.clone();
+        stale_args["dry_run"] = json!(false);
+        stale_args["expected_plan_revision"] = refused["plan_revision"].clone();
+        let stale = served_call(&handler, stale_args).await;
+        assert_eq!(stale["diagnostics"][0]["code"], "stale_plan_revision");
+        assert_eq!(mock.capture.lock().unwrap().begin_count, 0);
+
+        let mut apply = opted;
+        apply["dry_run"] = json!(false);
+        apply["expected_plan_revision"] = dry["plan_revision"].clone();
+        let applied = served_call(&handler, apply).await;
+        assert_eq!(applied["status"], "applied", "{applied}");
+        assert_eq!(mock.capture.lock().unwrap().update_batches, vec![1]);
+    }
+
+    async fn apply_swap_with(
+        fail_update: bool,
+        corrupt_commits: usize,
+    ) -> (serde_json::Value, MutationCapture, Vec<prost_types::Any>) {
+        let (_temp, board, items) = swap_fixture();
+        let before = vec![items[2].clone()];
+        let mock =
+            spawn_planner_mock_full(&board, before.clone(), fail_update, corrupt_commits, &[]);
+        let handler = served_handler(&mock.url).await;
+        let swap = json!([{"reference": "SW1", "library_id": "Test:Replacement"}]);
+        let dry = served_call(&handler, json!({"board": board, "replacements": swap})).await;
+        let result = served_call(
+            &handler,
+            json!({"board": board, "replacements": swap, "dry_run": false,
+                   "expected_plan_revision": dry["plan_revision"]}),
+        )
+        .await;
+        let capture = std::mem::take(&mut *mock.capture.lock().unwrap());
+        (result, capture, before)
+    }
+
+    #[tokio::test]
+    async fn swap_failure_outcomes_drop_the_commit_or_roll_back_truthfully() {
+        use kiapi::common::commands::CommitAction::{CmaCommit, CmaDrop};
+        let (failed, capture, _) = apply_swap_with(true, 0).await;
+        assert_eq!(failed["is_error"], true, "{failed}");
+        assert_eq!(capture.commit_actions, vec![CmaDrop]);
+
+        let (mismatch, capture, before) = apply_swap_with(false, 1).await;
+        let text = mismatch["message"].as_str().unwrap();
+        assert!(text.contains("independent readback differs"), "{text}");
+        assert!(text.contains("rolled back"), "{text}");
+        assert_eq!(capture.commit_actions, vec![CmaCommit, CmaCommit]);
+        assert_eq!(
+            capture.final_items, before,
+            "the original footprint is back"
+        );
+
+        let (unconfirmed, capture, before) = apply_swap_with(false, 2).await;
+        let text = unconfirmed["message"].as_str().unwrap();
+        assert!(
+            text.contains("could not be confirmed") && text.contains("Undo"),
+            "{text}"
+        );
+        assert!(!text.contains("rolled back"), "{text}");
+        assert_ne!(capture.final_items, before);
+    }
+
+    fn bulk_footprints(count: usize) -> Vec<prost_types::Any> {
+        (1..=count)
+            .map(|n| plan_item(&format!("U{n}"), Some("Test:Socket"), &format!("id-{n}")))
+            .collect()
+    }
+
+    fn without_models(item: &prost_types::Any) -> Vec<u8> {
+        let mut instance = decode_instance(item);
+        instance
+            .definition
+            .as_mut()
+            .unwrap()
+            .items
+            .retain(|item| !item.type_url.ends_with("Footprint3DModel"));
+        instance.encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn served_bulk_models_apply_57_footprints_in_one_commit_touching_only_models() {
+        let (_temp, board, _) = swap_fixture();
+        let before = bulk_footprints(57);
+        let mock = spawn_planner_mock_batch(&board, before.clone(), false, 0);
+        let handler = served_handler(&mock.url).await;
+        let dry = served_call(&handler, json!({"board": board, "scope": "models"})).await;
+        assert_eq!(dry["status"], "ready", "{dry}");
+        assert_eq!(dry["coverage"]["changed"]["planned"], 57);
+        assert_eq!(dry["model_inspections"].as_array().unwrap().len(), 57);
+        for change in dry["changes"].as_array().unwrap() {
+            assert_eq!(change["changed_domains"], json!(["models"]));
+        }
+
+        let stale = served_call(
+            &handler,
+            json!({"board": board, "scope": "models", "dry_run": false, "expected_plan_revision": "stale"}),
+        )
+        .await;
+        assert_eq!(stale["diagnostics"][0]["code"], "stale_plan_revision");
+        assert_eq!(mock.capture.lock().unwrap().begin_count, 0);
+
+        // A revision reviewed for the full refresh cannot apply the models-only scope.
+        let full = served_call(&handler, json!({"board": board})).await;
+        let wrong_scope = served_call(
+            &handler,
+            json!({"board": board, "scope": "models", "dry_run": false,
+                   "expected_plan_revision": full["plan_revision"]}),
+        )
+        .await;
+        assert_eq!(wrong_scope["diagnostics"][0]["code"], "stale_plan_revision");
+
+        let applied = served_call(
+            &handler,
+            json!({"board": board, "scope": "models", "dry_run": false,
+                   "expected_plan_revision": dry["plan_revision"]}),
+        )
+        .await;
+        assert_eq!(applied["status"], "applied", "{applied}");
+        assert_eq!(applied["coverage"]["changed"]["applied"], 57);
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.begin_count, 1);
+        assert_eq!(capture.update_batches, vec![57], "one batch, not 57 calls");
+        assert_eq!(
+            capture.commit_actions,
+            vec![kiapi::common::commands::CommitAction::CmaCommit]
+        );
+        let library = parse_library_footprint("Test:Socket", KICAD_LIBRARY_FOOTPRINT).unwrap();
+        let expected_models = library
+            .models
+            .iter()
+            .map(|model| builders::pack_any(model, "kiapi.board.types.Footprint3DModel"))
+            .collect::<Vec<_>>();
+        assert!(!expected_models.is_empty());
+        for (old, new) in before.iter().zip(&capture.final_items) {
+            assert_eq!(
+                without_models(old),
+                without_models(new),
+                "only Models may change"
+            );
+            let models = decode_instance(new)
+                .definition
+                .unwrap()
+                .items
+                .into_iter()
+                .filter(|item| item.type_url.ends_with("Footprint3DModel"))
+                .collect::<Vec<_>>();
+            assert_eq!(models, expected_models);
+        }
+    }
+
+    #[tokio::test]
+    async fn served_bulk_models_selected_by_references_leave_the_rest_alone() {
+        let (_temp, board, _) = swap_fixture();
+        let mut before = bulk_footprints(4);
+        before.push(plan_item("X1", Some("Test:Other"), "id-x"));
+        let mock = spawn_planner_mock_batch(&board, before.clone(), false, 0);
+        let handler = served_handler(&mock.url).await;
+        let selection = json!({"board": board, "scope": "models", "references": ["U2", "U3"]});
+        let dry = served_call(&handler, selection.clone()).await;
+        assert_eq!(dry["coverage"]["changed"]["planned"], 2, "{dry}");
+        let mut apply = selection;
+        apply["dry_run"] = json!(false);
+        apply["expected_plan_revision"] = dry["plan_revision"].clone();
+        assert_eq!(served_call(&handler, apply).await["status"], "applied");
+        let capture = mock.capture.lock().unwrap();
+        assert_eq!(capture.update_batches, vec![2]);
+        for (index, (old, new)) in before.iter().zip(&capture.final_items).enumerate() {
+            assert_eq!(old == new, index != 1 && index != 2, "footprint {index}");
+        }
+    }
+
+    #[tokio::test]
+    async fn served_bulk_models_failure_outcomes_leave_all_57_footprints_as_they_were() {
+        use kiapi::common::commands::CommitAction::{CmaCommit, CmaDrop};
+        for (fail_update, corrupt, expected_actions, text_part) in [
+            (true, 0usize, vec![CmaDrop], "mock update failure"),
+            (false, 1, vec![CmaCommit, CmaCommit], "rolled back"),
+        ] {
+            let (_temp, board, _) = swap_fixture();
+            let before = bulk_footprints(57);
+            let mock = spawn_planner_mock_batch(&board, before.clone(), fail_update, corrupt);
+            let handler = served_handler(&mock.url).await;
+            let args = json!({"board": board, "scope": "models"});
+            let dry = served_call(&handler, args.clone()).await;
+            let mut apply = args;
+            apply["dry_run"] = json!(false);
+            apply["expected_plan_revision"] = dry["plan_revision"].clone();
+            let result = served_call(&handler, apply).await;
+            assert_eq!(result["is_error"], true, "{result}");
+            let text = result["message"].as_str().unwrap();
+            assert!(text.contains(text_part), "{text}");
+            let capture = mock.capture.lock().unwrap();
+            assert_eq!(capture.commit_actions, expected_actions);
+            assert_eq!(
+                capture.final_items, before,
+                "no footprint may be left changed"
+            );
+        }
+    }
+
+    #[test]
+    fn bulk_models_scope_does_not_rebuild_pads_even_when_the_library_has_unsupported_pad_clauses() {
+        // The full refresh refuses this library; models-only must not parse pads at all.
+        let (temp, board, items) = swap_fixture();
+        let unsupported = KICAD_LIBRARY_FOOTPRINT
+            .replace("(pad \"3\"", "(pad \"3\" (unsupported_future_clause 1)");
+        std::fs::write(
+            temp.path().join("Test.pretty/Socket.kicad_mod"),
+            unsupported,
+        )
+        .unwrap();
+        let models = plan_updates(
+            &board,
+            &items,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            &parse_filters(&json!({"scope": "models"})).unwrap(),
+        );
+        assert!(
+            models
+                .diagnostics
+                .iter()
+                .all(|d| d.code != "unsupported_library_footprint"),
+            "{:?}",
+            models.diagnostics
         );
     }
 }

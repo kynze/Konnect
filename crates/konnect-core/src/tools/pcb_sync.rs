@@ -852,7 +852,7 @@ fn plan_sync(netlist_source: &str, design: &ExportedDesign, board: &BoardState) 
             diagnostics.push(conflict(
                 "footprint_id_changed",
                 format!(
-                    "{} uses {} on the board but {} in the schematic",
+                    "{} uses {} on the board but {} in the schematic; swap it with update_footprints_from_library (replacements, dry run first)",
                     component.reference, footprint.footprint_id, component.footprint_id
                 ),
                 Some(&component.reference),
